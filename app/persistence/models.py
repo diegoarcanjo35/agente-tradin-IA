@@ -99,14 +99,46 @@ class Order(Base):
     stop_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
     take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
     is_close: Mapped[bool] = mapped_column(Boolean, default=False)
-    status: Mapped[str] = mapped_column(String(16), default="PENDING")
+    # Free-text column for backward compatibility with the DB, but every
+    # writer/reader goes through app.execution.order_state.OrderStatus and
+    # app.persistence.repo.transition_order_status() (Fase 2, item 7.2) --
+    # never written directly elsewhere.
+    status: Mapped[str] = mapped_column(String(16), default="PENDING_SUBMIT")
     exchange_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    mode: Mapped[str] = mapped_column(String(16))  # PAPER_LOCAL | BYBIT_DEMO
+    mode: Mapped[str] = mapped_column(String(16))  # PAPER_LOCAL | PAPER_LIVE | BYBIT_DEMO
+    # Fase 2, item 7.2: cumulative fill bookkeeping across possibly multiple
+    # fills of the same order -- SET semantics (not incremented), so
+    # repeated confirmation polls of the same exchange order never double
+    # count. See app.persistence.repo.record_fill().
+    filled_qty: Mapped[float] = mapped_column(Float, default=0.0)
+    avg_fill_price: Mapped[float] = mapped_column(Float, default=0.0)
+    fees_total: Mapped[float] = mapped_column(Float, default=0.0)
+    # Fase 2, item 7.6: the price the decision was made against (the
+    # candle/trigger price passed as `reference_price` to
+    # ExecutionEngine.submit()) -- needed to compute realized slippage
+    # (avg_fill_price vs. this) per order. Nullable: a pre-Fase-2 order
+    # migrated from an older schema never had this recorded.
+    reference_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
     risk_evaluation: Mapped["RiskEvaluation"] = relationship(back_populates="orders")
     executions: Mapped[list["Execution"]] = relationship(back_populates="order")
+
+
+class OrderEvent(Base):
+    """Fase 2, item 7.2: audit trail of every order status transition --
+    written exclusively by app.persistence.repo.transition_order_status(),
+    which validates the transition via app.execution.order_state first."""
+
+    __tablename__ = "order_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), index=True)
+    from_status: Mapped[str] = mapped_column(String(16))
+    to_status: Mapped[str] = mapped_column(String(16))
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class Execution(Base):
@@ -168,6 +200,43 @@ class FailureReconciliation(Base):
     detail: Mapped[str] = mapped_column(Text)
     resolved: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Fase 2, item 7.4/7.7: optional links so a reconciliation/failure entry
+    # can be traced back to the specific order or operational session it
+    # happened under -- nullable, since most historical rows (and most
+    # reconciliation runs, which are symbol-wide, not order-specific) have
+    # no single order to point at.
+    order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"), nullable=True)
+    session_id: Mapped[int | None] = mapped_column(ForeignKey("operational_sessions.id"), nullable=True)
+
+
+class OperationalSession(Base):
+    """Fase 2, item 7.7: one row per execution session -- created or resumed
+    at process startup (app.sessions.start_or_resume_session), ended
+    explicitly (app.sessions.end_session) on graceful shutdown or a fatal
+    condition. Never mutated by anything outside app/sessions.py."""
+
+    __tablename__ = "operational_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_uid: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    mode: Mapped[str] = mapped_column(String(16))
+    symbol: Mapped[str] = mapped_column(String(32))
+    timeframe: Mapped[str] = mapped_column(String(8))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    end_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    strategy_version: Mapped[str] = mapped_column(String(64))
+    risk_config_json: Mapped[str] = mapped_column(Text)
+    config_snapshot_json: Mapped[str] = mapped_column(Text)  # sanitized -- never contains secrets
+    status: Mapped[str] = mapped_column(String(16), default="INICIALIZANDO")
+    candles_count: Mapped[int] = mapped_column(Integer, default=0)
+    signals_count: Mapped[int] = mapped_column(Integer, default=0)
+    approvals_count: Mapped[int] = mapped_column(Integer, default=0)
+    rejections_count: Mapped[int] = mapped_column(Integer, default=0)
+    orders_count: Mapped[int] = mapped_column(Integer, default=0)
+    fills_count: Mapped[int] = mapped_column(Integer, default=0)
+    failures_count: Mapped[int] = mapped_column(Integer, default=0)
+    reconciliations_count: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class SystemState(Base):
@@ -184,4 +253,20 @@ class SystemState(Base):
     api_failure_count: Mapped[int] = mapped_column(Integer, default=0)
     state_ambiguous: Mapped[bool] = mapped_column(Boolean, default=False)
     clock_out_of_sync: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Fase 2, item 7.5: independent block-cause flags, each derived and
+    # reset by its own code path -- never a shared/generic boolean.
+    # recompute_trading_blocked() combines all of these (and the older ones
+    # above) without ever letting clearing one silently clear another.
+    reconciliation_diverged: Mapped[bool] = mapped_column(Boolean, default=False)
+    reconciliation_stale: Mapped[bool] = mapped_column(Boolean, default=False)
+    order_state_unknown: Mapped[bool] = mapped_column(Boolean, default=False)
+    initialization_not_reconciled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_reconciliation_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Fase 2, item 7.8: process-is-running vs strategy-authorized-to-enter.
+    # INICIALIZANDO -> OBSERVANDO -> ATIVO (operator action) -> PAUSADO
+    # (operator action) -> BLOQUEADO (mirrors trading_blocked) -> ENCERRANDO.
+    operational_state: Mapped[str] = mapped_column(String(16), default="INICIALIZANDO")
+    active_session_id: Mapped[int | None] = mapped_column(
+        ForeignKey("operational_sessions.id"), nullable=True
+    )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

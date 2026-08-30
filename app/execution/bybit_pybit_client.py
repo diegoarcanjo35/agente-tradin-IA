@@ -42,6 +42,24 @@ def build_pybit_client(base_url: str, ws_url: str, api_key: str, api_secret: str
     return HTTP(api_key=api_key, api_secret=api_secret, **kwargs)
 
 
+def build_public_pybit_client(base_url: str, ws_url: str) -> HTTP:
+    """Fase 2, item 7.1 (PAPER_LIVE): the SAME host validation as
+    `build_pybit_client`, but constructed with NO credentials at all --
+    `pybit`'s HTTP() client works for public endpoints (kline, server time)
+    without api_key/api_secret; it simply can't sign private requests
+    (order create/cancel, position list), which PAPER_LIVE never calls
+    anyway (see app/api/main.py -- the PAPER_LIVE branch only ever pairs
+    this with PaperLocalExecutionEngine, never BybitDemoExecutionEngine)."""
+    env = assert_consistent_bybit_environment(base_url, ws_url)
+    kwargs = _PYBIT_ENV_KWARGS.get(env)
+    if kwargs is None:
+        raise ProductionEndpointBlockedError(
+            f"Ambiente Bybit '{env}' não possui configuração de cliente pybit suportada "
+            "nesta fase. Inicialização recusada."
+        )
+    return HTTP(**kwargs)
+
+
 class PybitTransport:
     """Routes our internal (url, params)/(url, payload) calls to the matching
     pybit method, by pattern-matching on the Bybit V5 path suffix we already
@@ -81,4 +99,7 @@ class PybitTransport:
         if url.endswith("/v5/order/create"):
             clean_payload = {k: v for k, v in payload.items() if v is not None}
             return self._call(self._client.place_order, **clean_payload)
+        if url.endswith("/v5/order/cancel"):
+            clean_payload = {k: v for k, v in payload.items() if v is not None}
+            return self._call(self._client.cancel_order, **clean_payload)
         raise NotImplementedError(f"No pybit POST mapping for {url}")

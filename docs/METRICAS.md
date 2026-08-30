@@ -48,3 +48,38 @@ posição aberta não contribui com nenhum valor de P&L realizado, apenas com
 `exposure_usd` (opcional, informativo). O painel consulta posições abertas
 por um endpoint separado (`/api/positions`), nunca fundido com os números de
 `/api/metrics`.
+
+## Custos e slippage (Fase 2, item 7.6)
+
+`app/metrics/engine.py::compute_cost_metrics()` — função pura separada de
+`compute_metrics()`, recebe `OrderFillView` (visão mínima de uma ordem
+preenchida: `side`, `reference_price`, `avg_fill_price`, `fees_total`),
+alimentada por `repo.filled_orders()` via `GET /api/costs`:
+
+- **Taxas acumuladas** = soma de `fees_total` de toda ordem preenchida —
+  sempre um valor real (0.0 para um conjunto vazio é um total genuíno, não
+  fabricado).
+- **Slippage realizado** = diferença entre o preço de execução
+  (`avg_fill_price`) e o preço de referência (`reference_price` — o preço
+  do candle/gatilho que originou a decisão, gravado em `orders.reference_price`
+  no momento do envio). Para `BUY`, pagar MAIS que a referência é
+  desfavorável (valor positivo); para `SELL`, receber MENOS é desfavorável.
+  Slippage favorável aparece como valor negativo — nunca truncado a zero,
+  para não esconder informação real do operador.
+- Só é calculado sobre ordens com `reference_price` conhecido
+  (`priced_orders_count`); se nenhuma ordem tiver essa informação (ex.:
+  ordens migradas de antes da Fase 2), `slippage_avg_usd`/`slippage_total_usd`
+  retornam `"indisponível"` — nunca um zero fabricado. `unpriced_orders_count`
+  reporta quantas ordens ficaram de fora desse cálculo.
+
+## AI Shadow: concordância e contrafactual (Fase 2, item 7.10)
+
+`app/metrics/ai_shadow_metrics.py::compute_ai_shadow_metrics()` — pura,
+compara cada recomendação da IA com a decisão real e autoritativa da
+estratégia (nunca o contrário: a IA nunca influencia a decisão real).
+`hypothetical_hit_rate` e `counterfactual_pnl` são **explicitamente
+retrospectivos** (só sobre operações que a estratégia já fechou de verdade
+e onde a IA concordou com a direção real) e devem ser sempre rotulados como
+**SIMULAÇÃO** em qualquer lugar que apareçam — nunca apresentados como um
+histórico real de desempenho da IA, já que ela nunca teve autoridade de
+execução.

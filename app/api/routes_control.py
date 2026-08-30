@@ -34,6 +34,7 @@ import hmac
 
 from fastapi import APIRouter, HTTPException, Request
 
+from app.execution.order_state import OrderStatus
 from app.persistence import repo
 from app.persistence.db import session_scope
 
@@ -80,6 +81,12 @@ def require_local_or_authenticated(request: Request) -> None:
 
 @router.post("/kill-switch/engage")
 def engage_kill_switch(request: Request):
+    """Fase 2, item 7.3: before considering the system stabilized, cancels
+    every non-terminal order this engine can actually cancel (has an
+    `exchange_order_id`). A pending order with no exchange_order_id yet
+    (crashed before it ever reached the exchange) can't be cancelled
+    remotely -- reconciliation, run at the end regardless, is what
+    resolves those against the exchange's real state."""
     orch = request.app.state.orchestrator
     with session_scope(orch.session_factory) as session:
         state = repo.get_or_create_system_state(session)
@@ -88,9 +95,42 @@ def engage_kill_switch(request: Request):
         repo.record_security_event(
             session, "KILL_SWITCH_ENGAGED", "Ativação manual do bloqueio de emergência pelo painel."
         )
+
+        cancelled_order_ids: list[int] = []
+        for order in repo.non_terminal_orders(session, mode=orch.settings.mode.value):
+            if not order.exchange_order_id:
+                continue
+            result = orch.execution_engine.cancel(order.exchange_order_id)
+            if result.status == OrderStatus.CANCELLED:
+                repo.transition_order_status(
+                    session, order, OrderStatus.CANCELLED,
+                    detail="Cancelada pelo bloqueio de emergência (kill switch).",
+                )
+                cancelled_order_ids.append(order.id)
+            elif result.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
+                # Race lost to a real fill -- book it truthfully, never a
+                # fake cancel; reconcile() below settles any position drift.
+                repo.record_fill(
+                    session, order, result.status,
+                    cumulative_filled_qty=result.filled_qty, avg_fill_price=result.avg_fill_price,
+                    fees_total=result.fee,
+                    detail="Corrida de cancelamento perdida para um fill durante o kill switch.",
+                )
+            else:
+                repo.transition_order_status(
+                    session, order, OrderStatus.UNKNOWN,
+                    detail="Cancelamento pelo kill switch não pôde ser confirmado.",
+                )
+
+        state.order_state_unknown = repo.has_unknown_orders(session)
+        repo.recompute_trading_blocked(state, orch.settings.risk_max_api_failures)
+        if cancelled_order_ids or repo.non_terminal_orders(session, mode=orch.settings.mode.value):
+            orch.reconcile(session, state)
+
         return {
             "kill_switch_engaged": True,
             "trading_blocked": state.trading_blocked,
+            "ordens_canceladas": cancelled_order_ids,
             "mensagem": "Bloqueio de emergência ativado. Nenhuma nova operação será realizada.",
         }
 
@@ -134,4 +174,89 @@ def disengage_kill_switch(request: Request):
             "kill_switch_engaged": False,
             "trading_blocked": False,
             "mensagem": "Bloqueio de emergência desativado. Operações liberadas.",
+        }
+
+
+_ACTIVATABLE_FROM = frozenset({"OBSERVANDO", "PAUSADO"})
+
+
+@router.post("/operational-state/activate")
+def activate_operational_state(request: Request):
+    """Fase 2, item 7.8: the ONLY way new entries ever become authorized --
+    a process/session always comes up in OBSERVANDO (see
+    app/api/main.py::build_orchestrator), never ATIVO. Reducing safety, so
+    it requires local origin or a valid control token (item 7.3/7.8: 'nenhum
+    endpoint permite mudar REPLAY/PAPER_LIVE/BYBIT_DEMO' -- this never
+    touches `mode`, only `operational_state`, which is a different axis)."""
+    require_local_or_authenticated(request)
+
+    orch = request.app.state.orchestrator
+    with session_scope(orch.session_factory) as session:
+        state = repo.get_or_create_system_state(session)
+
+        if state.trading_blocked:
+            return {
+                "operational_state": state.operational_state,
+                "mensagem": (
+                    f"Não é possível ativar novas entradas: operações estão bloqueadas "
+                    f"({state.block_reason})."
+                ),
+            }
+        if state.initialization_not_reconciled:
+            return {
+                "operational_state": state.operational_state,
+                "mensagem": (
+                    "Não é possível ativar novas entradas: a reconciliação inicial ainda não "
+                    "foi concluída."
+                ),
+            }
+        if state.operational_state not in _ACTIVATABLE_FROM:
+            return {
+                "operational_state": state.operational_state,
+                "mensagem": (
+                    f"Não é possível ativar a partir do estado operacional atual "
+                    f"({state.operational_state!r}); só é permitido a partir de OBSERVANDO ou PAUSADO."
+                ),
+            }
+
+        state.operational_state = "ATIVO"
+        if state.active_session_id is not None:
+            from app.persistence.models import OperationalSession
+
+            op_session = session.get(OperationalSession, state.active_session_id)
+            if op_session is not None:
+                op_session.status = "ATIVO"
+        repo.record_security_event(
+            session, "OPERATIONAL_STATE_ACTIVATED",
+            "Novas entradas ativadas manualmente pelo operador.",
+        )
+        return {
+            "operational_state": "ATIVO",
+            "mensagem": "Novas entradas ativadas. A estratégia pode abrir novas posições.",
+        }
+
+
+@router.post("/operational-state/pause")
+def pause_operational_state(request: Request):
+    """Fase 2, item 7.8: pausing, like engaging the kill switch, only ever
+    INCREASES safety -- it requires no authentication, same as
+    /kill-switch/engage. Never touches `mode`. Monitoring, reconciliation,
+    and reducing/closing exposure all continue while paused."""
+    orch = request.app.state.orchestrator
+    with session_scope(orch.session_factory) as session:
+        state = repo.get_or_create_system_state(session)
+        state.operational_state = "PAUSADO"
+        if state.active_session_id is not None:
+            from app.persistence.models import OperationalSession
+
+            op_session = session.get(OperationalSession, state.active_session_id)
+            if op_session is not None:
+                op_session.status = "PAUSADO"
+        repo.record_security_event(
+            session, "OPERATIONAL_STATE_PAUSED",
+            "Novas entradas pausadas manualmente pelo operador.",
+        )
+        return {
+            "operational_state": "PAUSADO",
+            "mensagem": "Novas entradas pausadas. Monitoramento, reconciliação e saídas continuam ativos.",
         }

@@ -66,7 +66,7 @@ def test_bybit_demo_timeout_on_submit_does_not_crash_and_yields_error_status():
     order = make_order()
     key = make_idempotency_key(order, "bucket-1")
     result = engine.submit(order, key)
-    assert result.status == "ERROR"
+    assert result.status == "UNKNOWN"
 
 
 def test_bybit_demo_rate_limit_on_submit_yields_error_status():
@@ -76,7 +76,7 @@ def test_bybit_demo_rate_limit_on_submit_yields_error_status():
     order = make_order()
     key = make_idempotency_key(order, "bucket-1")
     result = engine.submit(order, key)
-    assert result.status == "ERROR"
+    assert result.status == "UNKNOWN"
 
 
 def test_bybit_demo_http_200_alone_is_not_treated_as_executed():
@@ -89,7 +89,7 @@ def test_bybit_demo_http_200_alone_is_not_treated_as_executed():
     order_id = f"EX-{key[:12]}"
     # No status queued -> polling finds nothing -> must NOT report FILLED.
     result = engine.submit(order, key)
-    assert result.status == "ERROR"
+    assert result.status == "UNKNOWN"
     assert result.fill_qty == 0.0
 
 

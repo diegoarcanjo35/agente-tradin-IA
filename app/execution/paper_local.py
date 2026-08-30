@@ -7,7 +7,8 @@ from __future__ import annotations
 from typing import Callable
 
 from app.core.logging import get_logger, log_event
-from app.execution.base import FillResult
+from app.execution.base import CancelResult, FillResult
+from app.execution.order_state import OrderStatus
 from app.risk.engine import ApprovedOrder
 
 logger = get_logger(__name__)
@@ -57,7 +58,7 @@ class PaperLocalExecutionEngine:
             fill_price=fill_price,
             fee=fee,
             is_partial=is_partial,
-            status="PARTIALLY_FILLED" if is_partial else "FILLED",
+            status=OrderStatus.PARTIALLY_FILLED if is_partial else OrderStatus.FILLED,
         )
         self._seen_keys[idempotency_key] = result
         self._apply_to_position(order, result)
@@ -112,3 +113,19 @@ class PaperLocalExecutionEngine:
 
     def get_position(self, symbol: str) -> dict | None:
         return self._positions.get(symbol)
+
+    def cancel(self, exchange_order_id: str) -> CancelResult:
+        """Fase 2, item 7.3: PAPER_LOCAL/PAPER_LIVE orders fill instantly and
+        synchronously inside submit() -- there is never a non-terminal
+        window in which a cancel request could arrive. Any order this
+        engine has ever seen is already FILLED/PARTIALLY_FILLED by the time
+        cancel() could be called, so this is a documented no-op that
+        reports whatever terminal fill state was already recorded, never a
+        fabricated CANCELLED."""
+        for result in self._seen_keys.values():
+            if result.exchange_order_id == exchange_order_id:
+                return CancelResult(
+                    exchange_order_id=exchange_order_id, status=result.status,
+                    filled_qty=result.fill_qty, avg_fill_price=result.fill_price, fee=result.fee,
+                )
+        return CancelResult(exchange_order_id=exchange_order_id, status=OrderStatus.UNKNOWN)

@@ -91,17 +91,46 @@ usuário como frase. Verificado por `tests/test_frontend_i18n.py`.
   divergência é reportada, nunca corrigida silenciosamente.
 - `Orchestrator.reconcile()` integra essa função pura ao sistema em execução:
   roda uma vez na inicialização de `build_orchestrator()` (cobre "primeira
-  inicialização" e "depois de reinício", em qualquer modo), e novamente
-  sempre que uma ordem termina em status não confirmado (`ERROR`) — timeout
-  na criação, falha ao confirmar status via polling. Se a exchange não puder
-  sequer ser consultada, ou se houver qualquer divergência, o sistema entra
-  em `state_ambiguous=True` + `TRADING_BLOCKED=True`, registrado em
-  `security_events` e `failures_reconciliations`. O Risk Engine (tanto
-  `evaluate()` quanto `evaluate_close()`) recusa qualquer decisão enquanto
-  `state_ambiguous` estiver ativo — só uma reconciliação bem-sucedida
-  subsequente libera automaticamente um bloqueio causado por divergência
-  (um bloqueio por kill switch nunca é limpo automaticamente). Ver
-  `tests/test_reconciliation_integration.py`.
+  inicialização" e "depois de reinício", em qualquer modo), sempre que uma
+  ordem termina em status não confirmado (`UNKNOWN` — timeout na criação,
+  falha ao confirmar status via polling), e agora também **periodicamente**
+  (Fase 2, item 7.4): a cada `tick()`, se já se passou
+  `RECONCILIATION_INTERVAL_SECONDS` desde a última reconciliação, uma nova
+  roda automaticamente, antes de qualquer outra decisão do tick. Se a
+  exchange não puder sequer ser consultada, ou se houver qualquer
+  divergência, o sistema entra em `state_ambiguous=True` +
+  `reconciliation_diverged=True` (Fase 2: causa nomeada especificamente,
+  em paralelo ao `state_ambiguous` já existente) + `TRADING_BLOCKED=True`,
+  registrado em `security_events` e `failures_reconciliations`. O Risk
+  Engine (tanto `evaluate()` quanto `evaluate_close()`) recusa qualquer
+  decisão enquanto `state_ambiguous` estiver ativo — só uma reconciliação
+  bem-sucedida subsequente libera automaticamente um bloqueio causado por
+  divergência (um bloqueio por kill switch nunca é limpo automaticamente).
+  Se a reconciliação ficar mais atrasada que `RECONCILIATION_MAX_DELAY_SECONDS`,
+  `SystemState.reconciliation_stale=True` bloqueia **apenas** novas
+  aberturas (`RiskEngine.evaluate()`) — `evaluate_close()` nunca verifica
+  essa causa, então fechar/reduzir exposição continua sempre permitido
+  mesmo com reconciliação atrasada. Ver
+  `tests/test_reconciliation_integration.py` e
+  `tests/test_reconciliation_periodic_and_order_lifecycle.py`.
+
+## Estado operacional e ativação de novas entradas (Fase 2, item 7.8)
+
+- `POST /api/operational-state/activate` — move `OBSERVANDO`/`PAUSADO` para
+  `ATIVO`, autorizando a estratégia a abrir novas posições. Segue a MESMA
+  política de autenticação de `disengage_kill_switch`
+  (`require_local_or_authenticated`): origem local sempre permitida, remota
+  exige `CONTROL_API_TOKEN`. Recusa explicitamente (com mensagem em
+  português) se `trading_blocked`, se a reconciliação inicial ainda não
+  concluiu (`initialization_not_reconciled`), ou se o estado atual não é
+  `OBSERVANDO`/`PAUSADO`.
+- `POST /api/operational-state/pause` — sempre permitido, sem autenticação
+  (só aumenta segurança, mesma política de `engage_kill_switch`). Nunca
+  bloqueia fechamentos/reduções de posição.
+- Nenhum dos dois endpoints altera `mode` — a restrição de Fase 1 ("nenhum
+  endpoint troca REPLAY/PAPER_LOCAL/PAPER_LIVE/BYBIT_DEMO em tempo de
+  execução") permanece intacta; `operational_state` é um eixo
+  completamente separado. Ver `docs/FASE_2.md`.
 
 ## Relógio (drift)
 

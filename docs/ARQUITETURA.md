@@ -1,4 +1,4 @@
-# Arquitetura — Agente de Trading IA (Fase 1)
+# Arquitetura — Agente de Trading IA (Fase 1 + Fase 2)
 
 ## Visão geral
 
@@ -44,14 +44,18 @@ de `app/risk/engine.py` referencia o token privado de aprovação ou constrói
 - **app/execution** — `PaperLocalExecutionEngine` (simulação local, preenche
   usando o `reference_price` explícito passado pelo chamador — o preço do
   candle que gerou a decisão, ou o preço de gatilho de um stop/take) e
-  `BybitDemoExecutionEngine` (Bybit Demo/Testnet real, via cliente HTTP
+  `BybitDemoExecutionEngine` (Bybit Demo Trading real, via cliente HTTP
   injetado; produção usa `app/execution/bybit_pybit_client.py`, um adaptador
   sobre o cliente oficial `pybit`). Nenhum dos dois aceita nada além de um
   `ApprovedOrder`. Um HTTP 200 na criação da ordem nunca é tratado como
   execução confirmada — o motor sempre consulta o status da ordem antes de
-  reportar `FILLED`. `app/execution/reconciliation.py` compara posições
-  locais com as reportadas pela exchange; `Orchestrator.reconcile()` integra
-  essa checagem à inicialização e a qualquer ordem que termine em erro.
+  reportar `FILLED`. `app/execution/order_state.py` (Fase 2) define a
+  máquina de estados explícita de ordens e sua tabela de transições
+  permitidas — ver `docs/ORDEM_E_FILLS.md`. Ambos os motores implementam
+  `cancel()` (Fase 2, item 7.3). `app/execution/reconciliation.py` compara
+  posições locais com as reportadas pela exchange; `Orchestrator.reconcile()`
+  integra essa checagem à inicialização, a qualquer ordem que termine em
+  `UNKNOWN`, e agora também periodicamente (Fase 2, item 7.4).
 - **app/ai_shadow** — `AIShadowAgent` + `SimulatedProvider` (determinístico,
   offline, provedor padrão). Produz apenas dados estruturados validados;
   nunca referencia `app.execution` nem credenciais Bybit (ver
@@ -59,9 +63,11 @@ de `app/risk/engine.py` referencia o token privado de aprovação ou constrói
 - **app/metrics** — funções puras que recebem posições fechadas e retornam
   métricas; nunca inventam zero quando o dado é insuficiente (retornam a
   string `"indisponível"`).
+- **app/sessions** (Fase 2) — cria/retoma `operational_sessions` e
+  incrementa seus contadores; ver `docs/SESSOES_OPERACIONAIS.md`.
 - **app/api** — FastAPI: rotas de leitura (`routes_dashboard.py`) e de
-  controle (`routes_control.py`, apenas kill switch — não há endpoint de
-  troca de modo/ambiente).
+  controle (`routes_control.py`: kill switch + `operational-state/activate`
+  e `/pause` desde a Fase 2 — não há endpoint de troca de modo/ambiente).
 - **app/orchestrator.py** — conecta tudo por tick.
 - **frontend/** — painel single-page estático servido pelo próprio FastAPI.
 
@@ -92,16 +98,29 @@ de `app/risk/engine.py` referencia o token privado de aprovação ou constrói
    persistidos; se a ordem terminar em erro, `Orchestrator.reconcile()` roda
    antes de retornar.
 9. Caso contrário (sem posição a fechar), `RiskEngine.evaluate()` roda todos
-   os checks de abertura e retorna aprovação ou rejeição — sempre persistido
-   em `risk_evaluations`.
+   os checks de abertura — incluindo, desde a Fase 2, se a reconciliação
+   está atrasada (`reconciliation_stale`) e se `operational_state == "ATIVO"`
+   (item 7.8: novas entradas exigem ativação explícita do operador) — e
+   retorna aprovação ou rejeição, sempre persistido em `risk_evaluations`.
 10. Se aprovado, `ExecutionEngine.submit(..., reference_price=candle.close)`
     é chamado com uma chave de idempotência derivada do sinal; o resultado
-    (fill total, parcial, erro) é persistido em `orders`/`executions`, e uma
-    posição é aberta com a taxa de abertura já contabilizada.
+    (fill total, parcial, `UNKNOWN`) é persistido em `orders`/`executions`
+    através da máquina de estados (`repo.transition_order_status`/
+    `repo.record_fill`), e uma posição é aberta com a taxa de abertura já
+    contabilizada.
+
+Além disso, no início de cada `tick()` (Fase 2, item 7.4): se o intervalo de
+reconciliação configurado já passou, `Orchestrator.reconcile()` roda antes
+de qualquer outra decisão, e `SystemState.reconciliation_stale` é
+recalculado.
 
 ## Modos de execução
 
-`REPLAY` (padrão) → `PAPER_LOCAL` → `BYBIT_DEMO`. Detalhes em
-`docs/OPERACAO_DEMO.md`. Não existe endpoint ou variável de ambiente que
-alterne modo em tempo de execução — é configuração de processo, definida uma
-vez na inicialização.
+`REPLAY` (padrão) → `PAPER_LOCAL` → `PAPER_LIVE` (Fase 2: dados reais,
+execução simulada) → `BYBIT_DEMO`. Detalhes em `docs/OPERACAO_DEMO.md` e
+`docs/FASE_2.md`. Não existe endpoint ou variável de ambiente que alterne
+modo em tempo de execução — é configuração de processo, definida uma vez na
+inicialização. Separado disso, `operational_state`
+(`INICIALIZANDO`/`OBSERVANDO`/`ATIVO`/`PAUSADO`/`BLOQUEADO`/`ENCERRANDO`,
+Fase 2, item 7.8) controla se a estratégia pode abrir novas posições —
+sempre nasce em `OBSERVANDO`, nunca `ATIVO` automaticamente.

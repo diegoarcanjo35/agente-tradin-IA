@@ -10,13 +10,15 @@ timestamps em UTC (`app/core/clock.py::utcnow()`). Cadeia de rastreabilidade:
 | `strategy_signals` | Sinal produzido pela estratégia determinística | `direction`, `justification`, `observed_price`, `atr`, `params_json` |
 | `ai_recommendations` | Saída do AI Shadow Agent (validada ou rejeitada) | `signal_id` (FK), `recommendation`, `confidence`, `is_valid`, `rejection_reason` |
 | `risk_evaluations` | Decisão do Risk Engine para um sinal | `signal_id` (FK), `approved`, `reason`, `checks_json` (cada check individual) |
-| `orders` | Ordem submetida (PAPER_LOCAL ou BYBIT_DEMO) | `idempotency_key` (único), `risk_evaluation_id` (FK), `status`, `exchange_order_id`, `is_close` |
+| `orders` | Ordem submetida (PAPER_LOCAL, PAPER_LIVE ou BYBIT_DEMO) | `idempotency_key` (único), `risk_evaluation_id` (FK), `status` (máquina de estados — ver `docs/ORDEM_E_FILLS.md`), `exchange_order_id`, `is_close`, `filled_qty`, `avg_fill_price`, `fees_total`, `reference_price` |
+| `order_events` (Fase 2) | Auditoria de toda transição de status de ordem | `order_id` (FK), `from_status`, `to_status`, `detail` |
 | `executions` | Preenchimentos (fills), incluindo parciais | `order_id` (FK), `fill_qty`, `fill_price`, `fee`, `is_partial` |
 | `positions` | Posições abertas/fechadas | `status`, `realized_pnl`, `fees_paid` (acumula taxa de abertura + parciais + fechamento — nunca só a última), `opened_at`, `closed_at` |
 | `account_snapshots` | Fotos periódicas de saldo/equity | `balance`, `equity`, `unrealized_pnl`, `mode` |
-| `security_events` | Eventos de segurança (kill switch, bloqueio de endpoint de produção, drift de relógio, divergência de reconciliação) | `event_type`, `detail` |
-| `failures_reconciliations` | Falhas de execução e resultados de reconciliação (integrada ao Orchestrator, não só função isolada) | `kind` (FAILURE\|RECONCILIATION), `detail`, `resolved` |
-| `system_state` | Estado vivo (linha única, id=1) | `trading_blocked`, `kill_switch_engaged`, `consecutive_losses`, `cooldown_until`, `api_failure_count`, `state_ambiguous` |
+| `security_events` | Eventos de segurança (kill switch, bloqueio de endpoint de produção, drift de relógio, divergência de reconciliação, ativação/pausa operacional) | `event_type`, `detail` |
+| `failures_reconciliations` | Falhas de execução e resultados de reconciliação (integrada ao Orchestrator, não só função isolada) | `kind` (FAILURE\|RECONCILIATION), `detail`, `resolved`, `order_id`/`session_id` (FK opcionais, Fase 2) |
+| `operational_sessions` (Fase 2) | Uma linha por sessão de execução — ver `docs/SESSOES_OPERACIONAIS.md` | `session_uid`, `mode`, `symbol`, `status`, `started_at`/`ended_at`, contadores (`candles_count` etc.) |
+| `system_state` | Estado vivo (linha única, id=1) | `trading_blocked`, `kill_switch_engaged`, `consecutive_losses`, `cooldown_until`, `api_failure_count`, `state_ambiguous`, `clock_out_of_sync`, `reconciliation_diverged`, `reconciliation_stale`, `order_state_unknown`, `initialization_not_reconciled`, `last_reconciliation_at`, `operational_state`, `active_session_id` (FK) |
 
 ## Rastreabilidade ponta a ponta
 

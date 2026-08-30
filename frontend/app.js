@@ -6,7 +6,25 @@
 const $ = (id) => document.getElementById(id);
 
 const DIRECTION_LABELS = { BUY: "COMPRA", SELL: "VENDA", HOLD: "AGUARDAR" };
-const MODE_LABELS = { REPLAY: "REPLAY (simulado)", PAPER_LOCAL: "PAPER_LOCAL (simulado)", BYBIT_DEMO: "BYBIT_DEMO (Bybit Demo Trading)" };
+const MODE_LABELS = {
+  REPLAY: "REPLAY (simulado)",
+  PAPER_LOCAL: "PAPER_LOCAL (simulado)",
+  PAPER_LIVE: "PAPER_LIVE (dados reais, execução simulada)",
+  BYBIT_DEMO: "BYBIT_DEMO (Bybit Demo Trading)",
+};
+const OPERATIONAL_STATE_LABELS = {
+  INICIALIZANDO: "INICIALIZANDO",
+  OBSERVANDO: "OBSERVANDO (novas entradas desativadas)",
+  ATIVO: "ATIVO (novas entradas autorizadas)",
+  PAUSADO: "PAUSADO (novas entradas desativadas)",
+  BLOQUEADO: "BLOQUEADO",
+  ENCERRANDO: "ENCERRANDO",
+};
+const ORDER_STATUS_LABELS = {
+  PENDING_SUBMIT: "AGUARDANDO ENVIO", SUBMITTED: "ENVIADA", PARTIALLY_FILLED: "PARCIALMENTE PREENCHIDA",
+  FILLED: "PREENCHIDA", CANCEL_PENDING: "CANCELAMENTO PENDENTE", CANCELLED: "CANCELADA",
+  REJECTED: "REJEITADA", UNKNOWN: "DESCONHECIDA",
+};
 
 function translateDirection(direction) {
   return DIRECTION_LABELS[direction] || direction;
@@ -81,7 +99,67 @@ async function refreshState() {
   $("chip-conn").textContent = `CONEXÃO: ${s.mode === "REPLAY" ? "offline (replay)" : "ativa"}`;
   $("chip-trading").textContent = `OPERAÇÕES: ${s.trading_blocked ? "BLOQUEADAS" : "ATIVAS"}`;
   $("chip-kill").textContent = `BLOQUEIO DE EMERGÊNCIA: ${s.kill_switch_engaged ? "ATIVADO" : "desativado"}`;
+  $("chip-op-state").textContent = `ESTADO OPERACIONAL: ${OPERATIONAL_STATE_LABELS[s.operational_state] || s.operational_state}`;
+  $("env-banner").textContent = s.environment_banner;
   $("last-updated").textContent = new Date().toLocaleString("pt-BR");
+
+  // Causas de bloqueio independentes -- nunca colapsadas num único booleano
+  // (item 7.5/7.9), e estados críticos nunca dependem só de cor: cada linha
+  // também tem o texto SIM/NÃO em português, não apenas uma classe CSS.
+  const box = $("block-causes-box");
+  clearChildren(box);
+  kvRow(box, "Bloqueio de emergência manual", s.kill_switch_engaged ? "SIM" : "não", s.kill_switch_engaged ? "negative" : "");
+  kvRow(box, "Estado ambíguo / lacuna de mercado", s.state_ambiguous ? "SIM" : "não", s.state_ambiguous ? "negative" : "");
+  kvRow(box, "Relógio fora de sincronia", s.clock_out_of_sync ? "SIM" : "não", s.clock_out_of_sync ? "negative" : "");
+  kvRow(box, "Reconciliação divergente", s.reconciliation_diverged ? "SIM" : "não", s.reconciliation_diverged ? "negative" : "");
+  kvRow(box, "Reconciliação atrasada (só bloqueia novas entradas)", s.reconciliation_stale ? "SIM" : "não", s.reconciliation_stale ? "negative" : "");
+  kvRow(box, "Ordem em estado desconhecido", s.order_state_unknown ? "SIM" : "não", s.order_state_unknown ? "negative" : "");
+  kvRow(box, "Falhas de API", s.api_failure_count);
+  kvRow(box, "Última reconciliação", s.last_reconciliation_at ? new Date(s.last_reconciliation_at).toLocaleString("pt-BR") : "indisponível");
+  kvRow(box, "Intervalo de reconciliação (s)", s.reconciliation_interval_seconds);
+}
+
+async function refreshSession() {
+  const s = await getJSON("/api/session");
+  const box = $("session-box");
+  clearChildren(box);
+  if (!s) {
+    kvRow(box, "Sessão", "nenhuma sessão ativa ainda");
+    return;
+  }
+  kvRow(box, "Sessão", s.session_uid.slice(0, 8));
+  kvRow(box, "Status da sessão", OPERATIONAL_STATE_LABELS[s.status] || s.status);
+  kvRow(box, "Iniciada em", new Date(s.started_at).toLocaleString("pt-BR"));
+  kvRow(box, "Candles processados", s.candles_count);
+  kvRow(box, "Sinais gerados", s.signals_count);
+  kvRow(box, "Aprovações / Rejeições", `${s.approvals_count} / ${s.rejections_count}`);
+  kvRow(box, "Ordens / Fills", `${s.orders_count} / ${s.fills_count}`);
+  kvRow(box, "Falhas / Reconciliações", `${s.failures_count} / ${s.reconciliations_count}`);
+}
+
+async function refreshOrders() {
+  const rows = await getJSON("/api/orders?limit=20");
+  setRows(
+    document.querySelector("#orders-table tbody"),
+    rows.map((r) => [
+      new Date(r.created_at).toLocaleString("pt-BR"),
+      r.symbol,
+      translateDirection(r.side),
+      { text: ORDER_STATUS_LABELS[r.status] || r.status, className: r.status === "FILLED" ? "positive" : (r.status === "REJECTED" || r.status === "UNKNOWN") ? "negative" : "" },
+      r.filled_qty.toFixed(6),
+      r.avg_fill_price ? r.avg_fill_price.toFixed(2) : "-",
+    ])
+  );
+}
+
+async function refreshCosts() {
+  const c = await getJSON("/api/costs");
+  const box = $("costs-box");
+  clearChildren(box);
+  kvRow(box, "Taxas acumuladas", fmtNumber(c.fees_total));
+  kvRow(box, "Slippage médio (USD)", fmtNumber(c.slippage_avg_usd));
+  kvRow(box, "Slippage total (USD)", fmtNumber(c.slippage_total_usd));
+  kvRow(box, "Ordens com preço de referência conhecido", c.priced_orders_count);
 }
 
 async function refreshMetrics() {
@@ -212,6 +290,7 @@ async function refreshAll() {
   await Promise.all([
     refreshState(), refreshMetrics(), refreshAccount(), refreshSignals(),
     refreshRisk(), refreshAI(), refreshFailures(), refreshEquityCurve(),
+    refreshSession(), refreshOrders(), refreshCosts(),
   ]);
 }
 
@@ -222,6 +301,18 @@ $("btn-kill").addEventListener("click", async () => {
 });
 $("btn-unkill").addEventListener("click", async () => {
   const res = await getJSON("/api/kill-switch/disengage", { method: "POST" });
+  if (res.mensagem) $("status-message").textContent = res.mensagem;
+  refreshAll();
+});
+$("btn-activate").addEventListener("click", async () => {
+  // Confirmação explícita antes de ativar operação Demo (item 7.9).
+  if (!window.confirm("Confirma a ativação de novas entradas? A estratégia poderá abrir novas posições.")) return;
+  const res = await getJSON("/api/operational-state/activate", { method: "POST" });
+  if (res.mensagem) $("status-message").textContent = res.mensagem;
+  refreshAll();
+});
+$("btn-pause").addEventListener("click", async () => {
+  const res = await getJSON("/api/operational-state/pause", { method: "POST" });
   if (res.mensagem) $("status-message").textContent = res.mensagem;
   refreshAll();
 });

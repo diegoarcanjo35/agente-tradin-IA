@@ -81,6 +81,9 @@ def test_fill_price_tracks_the_originating_candle_not_a_fixed_value(session_fact
     candles = [make_candle(i, p) for i, p in enumerate(prices)]
 
     orch = build_test_orchestrator(session_factory, candles)
+    from tests.factories import activate_operational_state
+
+    activate_operational_state(orch)  # Fase 2, item 7.8: entries require explicit activation
 
     results = []
     for _ in range(len(candles) + 1):

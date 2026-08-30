@@ -54,6 +54,61 @@ class MetricsResult:
     exposure_usd: Metric
 
 
+@dataclass(frozen=True)
+class OrderFillView:
+    """Minimal view of a filled Order the cost/slippage metrics need
+    (Fase 2, item 7.6)."""
+
+    side: str  # BUY | SELL
+    reference_price: float | None
+    avg_fill_price: float
+    fees_total: float
+
+
+@dataclass(frozen=True)
+class CostMetricsResult:
+    fees_total: Metric
+    slippage_avg_usd: Metric
+    slippage_total_usd: Metric
+    priced_orders_count: int
+    unpriced_orders_count: int
+
+
+def compute_cost_metrics(orders: list[OrderFillView]) -> CostMetricsResult:
+    """Fase 2, item 7.6: fees accumulated and realized slippage versus the
+    reference price each order was decided against. Never invents a zero --
+    `fees_total` still sums whatever is known even with zero orders (0.0 is
+    a genuine, correct total for an empty set, not a fabricated one);
+    slippage is UNAVAILABLE only when NO order in the set has a known
+    reference_price (e.g. orders persisted before this field existed)."""
+    fees_total = sum(o.fees_total for o in orders)
+    priced = [o for o in orders if o.reference_price is not None]
+    unpriced_count = len(orders) - len(priced)
+
+    if not priced:
+        return CostMetricsResult(
+            fees_total=fees_total, slippage_avg_usd=UNAVAILABLE, slippage_total_usd=UNAVAILABLE,
+            priced_orders_count=0, unpriced_orders_count=unpriced_count,
+        )
+
+    slippages = []
+    for o in priced:
+        # BUY: paying MORE than the reference price is adverse (positive
+        # here = worse for the trader). SELL: receiving LESS is adverse.
+        if o.side == "BUY":
+            slippages.append(o.avg_fill_price - o.reference_price)
+        else:
+            slippages.append(o.reference_price - o.avg_fill_price)
+
+    return CostMetricsResult(
+        fees_total=fees_total,
+        slippage_avg_usd=sum(slippages) / len(slippages),
+        slippage_total_usd=sum(slippages),
+        priced_orders_count=len(priced),
+        unpriced_orders_count=unpriced_count,
+    )
+
+
 def _streaks(pnls: list[float]) -> tuple[int, int]:
     max_win = cur_win = 0
     max_loss = cur_loss = 0

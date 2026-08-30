@@ -25,6 +25,9 @@ class FakeBybitTransport:
             self.fail_next_n_with_rate_limit -= 1
             raise RateLimitError("simulated rate limit on order create")
 
+        if url.endswith("/v5/order/cancel"):
+            return {"retCode": 0, "result": {"orderId": payload.get("orderId")}}
+
         order_link_id = payload["orderLinkId"]
         order_id = f"EX-{order_link_id[:12]}"
         self.orders[order_id] = {"orderLinkId": order_link_id, "payload": payload}

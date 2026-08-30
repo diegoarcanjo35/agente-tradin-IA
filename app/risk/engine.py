@@ -69,6 +69,18 @@ class RiskContext:
     state_ambiguous: bool
     cooldown_until: datetime | None
     now: datetime
+    # Fase 2, item 7.4: entry-only gate (never applied to evaluate_close --
+    # a stale reconciliation must never block reducing/closing exposure).
+    # Defaults to False so every pre-existing RiskContext construction
+    # (which never mentions this field) is unaffected.
+    reconciliation_stale: bool = False
+    # Fase 2, item 7.8: entry-only gate -- "process running" vs "strategy
+    # authorized to open new entries". Defaults to "ATIVO" so every
+    # pre-existing RiskContext construction (predating this field) keeps
+    # approving entries exactly as before; only orchestrator-built contexts
+    # (which always pass the real SystemState.operational_state) can ever
+    # be anything else.
+    operational_state: str = "ATIVO"
 
 
 @dataclass(frozen=True)
@@ -133,6 +145,28 @@ class RiskEngine:
         common_rejection = self._check_common_gates(checks, context)
         if common_rejection is not None:
             return RiskEvaluationResult(approved=False, reason=common_rejection, checks=checks)
+
+        # Fase 2, item 7.4: entry-only -- evaluate_close() never checks this,
+        # so a stale reconciliation never blocks reducing/closing exposure.
+        checks["reconciliation_not_stale"] = not context.reconciliation_stale
+        if context.reconciliation_stale:
+            return reject(
+                "reconciliation_not_stale",
+                "Reconciliação periódica está atrasada além do limite configurado; novas "
+                "aberturas de posição estão bloqueadas até uma reconciliação recente.",
+            )
+
+        # Fase 2, item 7.8: entry-only -- evaluate_close() never checks this,
+        # so pausing/not-yet-activating the strategy never blocks
+        # reducing/closing exposure (only new entries require explicit
+        # operator activation).
+        checks["operational_state_active"] = context.operational_state == "ATIVO"
+        if not checks["operational_state_active"]:
+            return reject(
+                "operational_state_active",
+                f"Estado operacional atual é {context.operational_state!r}; novas aberturas de "
+                f"posição exigem ativação explícita do operador (estado ATIVO).",
+            )
 
         checks["cooldown_expired"] = (
             context.cooldown_until is None or context.now >= context.cooldown_until

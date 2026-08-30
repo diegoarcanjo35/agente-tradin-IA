@@ -19,8 +19,9 @@ obrigatório (`NOT NULL`), sem índice único em `candles`.
 |---|---|---|
 | `1` | v0 → v1 (correção v1.1) | Adiciona `system_state.state_ambiguous`; recria a tabela `orders` adicionando `is_close` e tornando `stop_loss` opcional (ordens de fechamento não têm stop-loss). |
 | `2` | v1 → v2 (correção v1.2) | Adiciona `system_state.clock_out_of_sync`; remove duplicatas históricas em `candles` (mantendo o registro de menor `id` — o mais antigo inserido — como canônico) e cria o índice único `uq_candle_symbol_timeframe_open_time`. |
+| `3` | v2 → v3 (Fase 2 v1.0) | Adiciona `orders.filled_qty`/`avg_fill_price`/`fees_total`/`reference_price` (máquina de estados de ordens, ver `docs/ORDEM_E_FILLS.md`); cria as tabelas `order_events` e `operational_sessions` (ver `docs/SESSOES_OPERACIONAIS.md`); adiciona as novas causas independentes de bloqueio em `system_state` (`reconciliation_diverged`, `reconciliation_stale`, `order_state_unknown`, `initialization_not_reconciled`, `last_reconciliation_at`, `operational_state`, `active_session_id`); adiciona `order_id`/`session_id` opcionais em `failures_reconciliations`. |
 
-`CURRENT_SCHEMA_VERSION = 2` (constante em `app/persistence/migrations.py`),
+`CURRENT_SCHEMA_VERSION = 3` (constante em `app/persistence/migrations.py`),
 sempre igual à versão da migration mais recente da lista `MIGRATIONS`.
 
 ## Quando as migrations rodam
@@ -87,6 +88,13 @@ coluna sentinela) contra o esquema real:
   único sobre `candles(symbol, timeframe, open_time)` — identificado pela
   **estrutura** (colunas cobertas), nunca por um nome fixo, então um índice
   criado por outra ferramenta com nome diferente ainda conta.
+- **v3**: as tabelas `operational_sessions` e `order_events` existem;
+  `orders.filled_qty`/`avg_fill_price`/`fees_total`/`reference_price`
+  existem; `failures_reconciliations.order_id`/`session_id` existem; todas
+  as novas colunas de `system_state` (`reconciliation_diverged`,
+  `reconciliation_stale`, `order_state_unknown`,
+  `initialization_not_reconciled`, `last_reconciliation_at`,
+  `operational_state`, `active_session_id`) existem.
 
 ### Cadeia ancestral completa, não só a versão mais alta (correção v1.5 #2)
 

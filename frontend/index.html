@@ -7,22 +7,35 @@
 <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-  <div class="banner">AMBIENTE DEMO — SEM DINHEIRO REAL</div>
+  <div id="env-banner" class="banner">AMBIENTE DEMO — SEM DINHEIRO REAL</div>
 
   <header class="topbar">
-    <h1>Agente de Trading IA — Fase 1</h1>
+    <h1>Agente de Trading IA — Fase 2</h1>
     <div class="status-chips">
       <span id="chip-mode" class="chip">MODO: --</span>
       <span id="chip-conn" class="chip">CONEXÃO: --</span>
       <span id="chip-trading" class="chip">OPERAÇÕES: --</span>
       <span id="chip-kill" class="chip">BLOQUEIO DE EMERGÊNCIA: --</span>
+      <span id="chip-op-state" class="chip">ESTADO OPERACIONAL: --</span>
     </div>
     <button id="btn-kill" class="btn-danger">Ativar bloqueio de emergência</button>
     <button id="btn-unkill" class="btn-secondary">Desativar bloqueio de emergência</button>
+    <button id="btn-activate" class="btn-secondary">Ativar novas entradas</button>
+    <button id="btn-pause" class="btn-secondary">Pausar novas entradas</button>
   </header>
   <div id="status-message" class="status-message"></div>
 
   <main>
+    <section class="grid-2">
+      <div class="card">
+        <h2>Estado Operacional e Causas de Bloqueio</h2>
+        <div id="block-causes-box">Carregando...</div>
+      </div>
+      <div class="card">
+        <h2>Sessão Atual</h2>
+        <div id="session-box">Carregando...</div>
+      </div>
+    </section>
     <section class="grid">
       <div class="card">
         <h2>Saldo &amp; Patrimônio (Equity)</h2>
@@ -60,11 +73,22 @@
 
     <section class="grid-2">
       <div class="card">
+        <h2>Ordens e Máquina de Estados</h2>
+        <table id="orders-table"><thead><tr><th>Hora</th><th>Símbolo</th><th>Lado</th><th>Status</th><th>Qtd Preenchida</th><th>Preço Médio</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="card">
+        <h2>Custos e Slippage</h2>
+        <div id="costs-box">Carregando...</div>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <div class="card">
         <h2>Decisões do Motor de Risco (Risk Engine)</h2>
         <table id="risk-table"><thead><tr><th>Hora</th><th>Situação</th><th>Motivo</th></tr></thead><tbody></tbody></table>
       </div>
       <div class="card">
-        <h2>IA em Modo de Observação (Shadow Mode)</h2>
+        <h2>IA em Modo de Observação (Shadow Mode) — nunca executa ordens</h2>
         <table id="ai-table"><thead><tr><th>Hora</th><th>Recomendação</th><th>Confiança</th><th>Resumo</th></tr></thead><tbody></tbody></table>
       </div>
     </section>
@@ -76,7 +100,7 @@
 
     <footer>
       <span>Última atualização: <span id="last-updated">--</span></span>
-      <p class="disclaimer">Este sistema opera exclusivamente no ambiente Demo/Testnet da Bybit. Não há garantia de rentabilidade. Nenhuma operação envolve dinheiro real.</p>
+      <p class="disclaimer">Este sistema opera exclusivamente no ambiente oficial Bybit Demo Trading. Não há garantia de rentabilidade. Nenhuma operação envolve dinheiro real.</p>
     </footer>
   </main>
 

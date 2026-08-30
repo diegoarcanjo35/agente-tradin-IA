@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.clock import utcnow
+from app.execution.order_state import NON_TERMINAL_STATUSES, OrderStatus, validate_transition
 from app.persistence.models import (
     AccountSnapshot,
     AIRecommendation,
@@ -19,6 +20,7 @@ from app.persistence.models import (
     Execution,
     FailureReconciliation,
     Order,
+    OrderEvent,
     Position,
     RiskEvaluation,
     SecurityEvent,
@@ -54,8 +56,41 @@ def recompute_trading_blocked(state: SystemState, max_api_failures: int) -> None
         reasons.append(
             f"limite de falhas consecutivas de API atingido ({state.api_failure_count}/{max_api_failures})"
         )
+    # Fase 2, item 7.5: each new cause is independent -- clearing one (e.g.
+    # a fresh reconciliation succeeding) never clears any of the others.
+    # `reconciliation_stale` is deliberately NOT included here: item 7.4
+    # requires staleness to block only NEW openings, never closes/reductions
+    # -- unlike every other cause above (which correctly blocks both, same
+    # as the pre-existing kill_switch/state_ambiguous/clock/api_failure
+    # behavior). It is instead checked as an entry-only gate inside
+    # RiskEngine.evaluate() via RiskContext.reconciliation_stale.
+    if state.reconciliation_diverged:
+        reasons.append("reconciliação periódica detectou divergência entre estado local e da corretora")
+    if state.order_state_unknown:
+        reasons.append("existe ordem em estado UNKNOWN -- não é seguro liberar nova exposição")
+    # `initialization_not_reconciled` is deliberately NOT one of the reasons
+    # here -- item 7.8 wants "process is running" (trading_blocked, which
+    # also affects closes) kept separate from "strategy is authorized to
+    # open new entries" (operational_state). Whether initialization has
+    # reconciled is instead one of the required gates checked by
+    # POST /operational-state/activate (app/api/routes_control.py) before
+    # operational_state may ever reach ATIVO, and is cleared automatically
+    # by Orchestrator.reconcile() the first time it actually completes.
     state.trading_blocked = bool(reasons)
     state.block_reason = "; ".join(reasons) if reasons else None
+
+    # Fase 2, item 7.8: BLOQUEADO always mirrors trading_blocked. Recovering
+    # from a block never auto-restores ATIVO (or even OBSERVANDO) by
+    # itself -- it only reverts to OBSERVANDO, so opening new entries again
+    # still requires the operator to explicitly re-activate (item 7.8:
+    # "ativação de novas entradas exige ação explícita do operador").
+    # ENCERRANDO is left untouched -- a graceful shutdown in progress is
+    # never overwritten back to BLOQUEADO/OBSERVANDO by this recompute.
+    if state.operational_state != "ENCERRANDO":
+        if state.trading_blocked:
+            state.operational_state = "BLOQUEADO"
+        elif state.operational_state == "BLOQUEADO":
+            state.operational_state = "OBSERVANDO"
 
 
 def record_security_event(session: Session, event_type: str, detail: str) -> SecurityEvent:
@@ -156,17 +191,94 @@ def find_order_by_idempotency_key(session: Session, key: str) -> Order | None:
     return session.execute(select(Order).where(Order.idempotency_key == key)).scalar_one_or_none()
 
 
+def non_terminal_orders(session: Session, mode: str | None = None) -> list[Order]:
+    """Fase 2, item 7.3: orders still open on the exchange (or in an
+    unresolved state) -- what the kill switch must attempt to cancel
+    before considering the system stabilized."""
+    non_terminal_values = [s.value for s in NON_TERMINAL_STATUSES]
+    stmt = select(Order).where(Order.status.in_(non_terminal_values))
+    if mode is not None:
+        stmt = stmt.where(Order.mode == mode)
+    return list(session.execute(stmt).scalars().all())
+
+
+def filled_orders(session: Session, symbol: str | None = None) -> list[Order]:
+    """Fase 2, item 7.6: orders that actually received at least one fill --
+    what cost/slippage metrics (app.metrics.engine.compute_cost_metrics)
+    are computed over."""
+    filled_values = [OrderStatus.FILLED.value, OrderStatus.PARTIALLY_FILLED.value]
+    stmt = select(Order).where(Order.status.in_(filled_values))
+    if symbol is not None:
+        stmt = stmt.where(Order.symbol == symbol)
+    return list(session.execute(stmt).scalars().all())
+
+
+def has_unknown_orders(session: Session) -> bool:
+    """Fase 2, item 7.2/7.5: whether any order currently sits in UNKNOWN --
+    the SystemState.order_state_unknown block-cause flag is always
+    re-derived from this query (never toggled ad hoc), so it self-heals the
+    moment every UNKNOWN order is resolved (manually or by reconciliation),
+    exactly like `recompute_trading_blocked` re-derives `trading_blocked`
+    from its sources instead of trusting a stale boolean."""
+    return session.execute(
+        select(Order.id).where(Order.status == OrderStatus.UNKNOWN.value).limit(1)
+    ).first() is not None
+
+
 def save_order(session: Session, idempotency_key: str, risk_evaluation_id: int, symbol: str,
                side: str, qty: float, stop_loss: float | None, take_profit: float | None,
-               mode: str, is_close: bool = False) -> Order:
+               mode: str, is_close: bool = False, reference_price: float | None = None) -> Order:
     o = Order(
         idempotency_key=idempotency_key, risk_evaluation_id=risk_evaluation_id,
         symbol=symbol, side=side, qty=qty, stop_loss=stop_loss, take_profit=take_profit,
-        mode=mode, status="PENDING", is_close=is_close,
+        mode=mode, status=OrderStatus.PENDING_SUBMIT.value, is_close=is_close,
+        reference_price=reference_price,
     )
     session.add(o)
     session.flush()
     return o
+
+
+def transition_order_status(
+    session: Session, order: Order, new_status: OrderStatus, detail: str | None = None,
+) -> None:
+    """Fase 2, item 7.2: the ONLY sanctioned way to change `Order.status`.
+    Validates the transition against `app.execution.order_state`'s explicit
+    table (raises IllegalOrderTransitionError, never silently coerces) and
+    writes an `order_events` audit row -- every jump an order ever makes is
+    reconstructable after the fact, not just its current status."""
+    current = OrderStatus(order.status)
+    validate_transition(current, new_status)
+    session.add(OrderEvent(
+        order_id=order.id, from_status=current.value, to_status=new_status.value, detail=detail,
+    ))
+    order.status = new_status.value
+    session.flush()
+
+
+def record_fill(
+    session: Session, order: Order, new_status: OrderStatus,
+    cumulative_filled_qty: float, avg_fill_price: float, fees_total: float,
+    detail: str | None = None,
+) -> None:
+    """Fase 2, item 7.2: books a fill using SET semantics (not increment) --
+    `cumulative_filled_qty`/`avg_fill_price`/`fees_total` are the order's
+    TOTAL state after this fill, exactly as Bybit's `cumExecQty`/`avgPrice`/
+    `cumExecFee` report it. This is what makes a second, later partial fill
+    (PARTIALLY_FILLED -> PARTIALLY_FILLED) or the eventual completion
+    (PARTIALLY_FILLED -> FILLED) safe to record without ever double-adding
+    quantity/fees -- the caller never needs to track which individual fill
+    was "already recorded," only the exchange's own running totals. It does
+    NOT make calling this twice with an unchanged TERMINAL status safe --
+    `transition_order_status` (used internally) correctly rejects a
+    terminal-to-itself transition, since a status poll that found nothing
+    new should simply not call this again (check `is_terminal(order.status)`
+    first)."""
+    transition_order_status(session, order, new_status, detail=detail)
+    order.filled_qty = cumulative_filled_qty
+    order.avg_fill_price = avg_fill_price
+    order.fees_total = fees_total
+    session.flush()
 
 
 def save_execution(session: Session, order_id: int, fill_qty: float, fill_price: float,

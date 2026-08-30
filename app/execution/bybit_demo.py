@@ -15,7 +15,8 @@ from typing import Callable
 from app.core.config import assert_demo_host
 from app.core.errors import ExchangeTimeoutError, RateLimitError
 from app.core.logging import get_logger, log_event
-from app.execution.base import FillResult
+from app.execution.base import CancelResult, FillResult
+from app.execution.order_state import OrderStatus
 from app.risk.engine import ApprovedOrder
 
 logger = get_logger(__name__)
@@ -66,16 +67,16 @@ class BybitDemoExecutionEngine:
             )
         except ExchangeTimeoutError as exc:
             log_event(logger, 40, "order_submit_timeout", error=str(exc))
-            result = FillResult("", 0.0, 0.0, 0.0, False, "ERROR")
+            result = FillResult("", 0.0, 0.0, 0.0, False, OrderStatus.UNKNOWN)
             return result
         except RateLimitError as exc:
             log_event(logger, 40, "order_submit_rate_limited", error=str(exc))
-            result = FillResult("", 0.0, 0.0, 0.0, False, "ERROR")
+            result = FillResult("", 0.0, 0.0, 0.0, False, OrderStatus.UNKNOWN)
             return result
 
         exchange_order_id = create_resp.get("result", {}).get("orderId")
         if not exchange_order_id:
-            result = FillResult("", 0.0, 0.0, 0.0, False, "REJECTED")
+            result = FillResult("", 0.0, 0.0, 0.0, False, OrderStatus.REJECTED)
             self._seen_keys[idempotency_key] = result
             return result
 
@@ -112,13 +113,62 @@ class BybitDemoExecutionEngine:
                     fill_price=avg_price,
                     fee=fee,
                     is_partial=(status == "PartiallyFilled"),
-                    status="FILLED" if status == "Filled" else "PARTIALLY_FILLED",
+                    status=OrderStatus.FILLED if status == "Filled" else OrderStatus.PARTIALLY_FILLED,
                 )
             if status in ("Rejected", "Cancelled"):
-                return FillResult(exchange_order_id, 0.0, 0.0, 0.0, False, "REJECTED")
+                return FillResult(exchange_order_id, 0.0, 0.0, 0.0, False, OrderStatus.REJECTED)
         # Could not confirm after polling: leave unresolved for reconciliation,
         # never claim FILLED without confirmation.
-        return FillResult(exchange_order_id, 0.0, 0.0, 0.0, False, "ERROR")
+        return FillResult(exchange_order_id, 0.0, 0.0, 0.0, False, OrderStatus.UNKNOWN)
+
+    def cancel(self, exchange_order_id: str) -> CancelResult:
+        """Fase 2, item 7.3: requests cancellation, then ALWAYS confirms the
+        real final state via the same status-polling loop as submit() --
+        never assumes CANCELLED just because the cancel request was
+        accepted. If a fill won the race before the cancel took effect,
+        this reports FILLED/PARTIALLY_FILLED (with the real fill data)
+        instead, so the caller persists that fill and adjusts the position
+        rather than incorrectly treating the order as cancelled."""
+        try:
+            self._http_post(
+                f"{self.base_url}/v5/order/cancel",
+                {"category": "linear", "orderId": exchange_order_id},
+            )
+        except (ExchangeTimeoutError, RateLimitError) as exc:
+            log_event(logger, 40, "order_cancel_request_failed", error=str(exc))
+            # Fall through to confirmation regardless -- the cancel may have
+            # been received by the exchange even if the response was lost.
+
+        for attempt in range(self.max_status_polls):
+            if attempt > 0:
+                self._sleep(self.poll_interval_seconds)
+            try:
+                status_resp = self._http_get(
+                    f"{self.base_url}/v5/order/realtime",
+                    {"category": "linear", "orderId": exchange_order_id},
+                )
+            except (ExchangeTimeoutError, RateLimitError) as exc:
+                log_event(logger, 30, "order_cancel_status_poll_failed", error=str(exc))
+                continue
+
+            rows = status_resp.get("result", {}).get("list", [])
+            if not rows:
+                continue
+            row = rows[0]
+            status = row.get("orderStatus")
+            if status == "Cancelled":
+                return CancelResult(exchange_order_id=exchange_order_id, status=OrderStatus.CANCELLED)
+            if status in ("Filled", "PartiallyFilled"):
+                # Race lost to a fill -- report it truthfully, never a fake cancel.
+                return CancelResult(
+                    exchange_order_id=exchange_order_id,
+                    status=OrderStatus.FILLED if status == "Filled" else OrderStatus.PARTIALLY_FILLED,
+                    filled_qty=float(row.get("cumExecQty", 0.0)),
+                    avg_fill_price=float(row.get("avgPrice", 0.0)),
+                    fee=float(row.get("cumExecFee", 0.0)),
+                )
+        # Could not confirm the final state -- never claim CANCELLED without confirmation.
+        return CancelResult(exchange_order_id=exchange_order_id, status=OrderStatus.UNKNOWN)
 
     def get_position(self, symbol: str) -> dict | None:
         resp = self._http_get(

@@ -1,9 +1,11 @@
-# Agente de Trading IA — Fase 1 (MVP Bybit Demo)
+# Agente de Trading IA — Fase 1 + Fase 2 (Bybit Demo)
 
 Sistema automatizado de trading conectado **exclusivamente** ao ambiente
-oficial Bybit Demo/Testnet. Não opera dinheiro real, não aceita configuração
+oficial Bybit Demo Trading. Não opera dinheiro real, não aceita configuração
 de produção, e não promete rentabilidade. Ver `docs/SEGURANCA.md` para as
-garantias de segurança e `docs/ARQUITETURA.md` para a arquitetura completa.
+garantias de segurança, `docs/ARQUITETURA.md` para a arquitetura completa e
+`docs/FASE_2.md` para o que a Fase 2 (operação contínua e validação
+controlada) adiciona sobre a Fase 1.
 
 **AMBIENTE DEMO — SEM DINHEIRO REAL.**
 
@@ -34,8 +36,8 @@ recomendações da IA em shadow mode, curva de equity e histórico de erros.
 Não inicie o servidor com `uvicorn app.api.main:app --host ...` diretamente
 — esse caminho contorna a validação de host feita pelo launcher.
 
-Para os demais modos (`PAPER_LOCAL`, `BYBIT_DEMO`), copie `.env.example`
-para `.env` e siga `docs/OPERACAO_DEMO.md`.
+Para os demais modos (`PAPER_LOCAL`, `PAPER_LIVE`, `BYBIT_DEMO`), copie
+`.env.example` para `.env` e siga `docs/OPERACAO_DEMO.md`.
 
 ## Testes
 
@@ -49,9 +51,14 @@ para `.env` e siga `docs/OPERACAO_DEMO.md`.
 |---|---|---|---|
 | `REPLAY` (padrão) | fixture local | simulada | nenhuma |
 | `PAPER_LOCAL` | fixture local | simulada (taxa/slippage configuráveis) | nenhuma |
-| `BYBIT_DEMO` | Bybit Demo/Testnet | Bybit Demo/Testnet | API key/secret demo, sem saque |
+| `PAPER_LIVE` (Fase 2) | Bybit Demo Trading (endpoints públicos) | simulada, nunca reage à corretora | nenhuma |
+| `BYBIT_DEMO` | Bybit Demo Trading | Bybit Demo Trading | API key/secret demo, sem saque |
 
-## Como gerar credenciais Demo/Testnet
+Novas entradas (posições) exigem ativação explícita do operador em
+**qualquer** modo (`POST /api/operational-state/activate`) — o processo
+sempre inicia em `OBSERVANDO`, nunca `ATIVO`. Ver `docs/FASE_2.md`.
+
+## Como gerar credenciais Bybit Demo Trading
 
 Ver `docs/OPERACAO_DEMO.md`.
 
@@ -86,6 +93,11 @@ bloqueio de emergência" no painel, ou `POST /api/kill-switch/engage`.
 - `docs/OPERACAO_DEMO.md`
 - `docs/MODELO_DE_DADOS.md`
 - `docs/MIGRACOES.md`
+- `docs/FASE_2.md` — visão geral do que a Fase 2 adiciona
+- `docs/ORDEM_E_FILLS.md` — máquina de estados de ordens e cancelamento
+- `docs/SESSOES_OPERACIONAIS.md` — sessões e estado operacional
+- `docs/ROTEIRO_TESTE_MANUAL_DEMO.md` — roteiro (não executado automaticamente,
+  exige autorização separada)
 
 ---
 

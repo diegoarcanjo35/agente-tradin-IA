@@ -19,10 +19,13 @@ from app.core.config import Settings
 from app.core.logging import get_logger, log_event
 from app.execution.base import ExecutionEngine
 from app.execution.idempotency import make_idempotency_key
+from app.execution.order_state import OrderStatus
 from app.execution.reconciliation import reconcile_positions
 from app.market_data.base import CandleFetchStatus, MarketDataProvider
 from app.persistence import repo
+from app.persistence.models import OperationalSession
 from app.risk.engine import RiskContext, RiskEngine
+from app.sessions import increment as increment_session_counter
 from app.strategy.engine import StrategyEngine
 
 logger = get_logger(__name__)
@@ -63,6 +66,37 @@ class Orchestrator:
 
         with session_scope(self.session_factory) as session:
             state = repo.get_or_create_system_state(session)
+
+            # Fase 2, item 7.4: reconciliation now also runs periodically,
+            # not only at startup or right after a failed order -- if it's
+            # been longer than `reconciliation_interval_seconds` since the
+            # last run, do one now, before anything else this tick. A
+            # SystemState with no prior reconciliation at all
+            # (last_reconciliation_at is None) is treated as "not yet due"
+            # here rather than "infinitely stale" -- app/api/main.py always
+            # runs one real reconciliation at startup before the first tick
+            # in production; this only matters for tests that build an
+            # Orchestrator directly without that startup call.
+            # SQLite round-trips DateTime(timezone=True) as naive regardless
+            # of what was stored (same defense as
+            # repo.get_last_candle_open_time) -- never compare naive vs.
+            # aware.
+            last_reconciliation_at = state.last_reconciliation_at
+            if last_reconciliation_at is not None and last_reconciliation_at.tzinfo is None:
+                last_reconciliation_at = last_reconciliation_at.replace(tzinfo=timezone.utc)
+
+            if last_reconciliation_at is not None:
+                elapsed = (utcnow() - last_reconciliation_at).total_seconds()
+                if elapsed >= self.settings.reconciliation_interval_seconds:
+                    self.reconcile(session, state)
+                    last_reconciliation_at = state.last_reconciliation_at
+
+            if last_reconciliation_at is not None:
+                delay = (utcnow() - last_reconciliation_at).total_seconds()
+                state.reconciliation_stale = delay > self.settings.reconciliation_max_delay_seconds
+            else:
+                state.reconciliation_stale = False
+            repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
 
             # Correction v1.4 #2: before polling, tell the provider the last
             # candle actually persisted for its symbol/timeframe -- cheap
@@ -130,6 +164,9 @@ class Orchestrator:
                 # and never re-triggers strategy/AI/risk processing.
                 return {"status": "duplicate_candle"}
 
+            op_session = self._active_session(session, state)
+            increment_session_counter(op_session, "candles_count")
+
             # A fresh candle was received and persisted: the API is healthy.
             state.api_failure_count = 0
             repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
@@ -141,8 +178,9 @@ class Orchestrator:
                 session, signal.symbol, signal.direction, signal.justification,
                 signal.observed_price, signal.atr, signal.params,
             )
+            increment_session_counter(op_session, "signals_count")
 
-            self._run_ai_shadow(session, signal, signal_row.id, candle.close)
+            self._run_ai_shadow(session, state, op_session, signal, signal_row.id, candle.close)
 
             data_is_stale = self.market_data_provider.is_stale(
                 self.settings.risk_max_data_staleness_seconds
@@ -193,6 +231,7 @@ class Orchestrator:
             risk_row = repo.save_risk_evaluation(
                 session, signal_row.id, risk_result.approved, risk_result.reason, risk_result.checks
             )
+            increment_session_counter(op_session, "approvals_count" if risk_result.approved else "rejections_count")
 
             if not risk_result.approved or risk_result.approved_order is None:
                 return {"status": "rejected", "reason": risk_result.reason}
@@ -200,6 +239,16 @@ class Orchestrator:
             return self._submit_and_record(
                 session, state, risk_row.id, risk_result.approved_order, candle.open_time, candle.close
             )
+
+    def _active_session(self, session, state) -> OperationalSession | None:
+        """Fase 2, item 7.7: the OperationalSession counters are updated
+        against, looked up cheaply by primary key. Returns None if no
+        session is active yet (e.g. a test-built Orchestrator that never
+        went through app.api.main.build_orchestrator) -- counters simply
+        aren't incremented in that case (see app.sessions.increment)."""
+        if state.active_session_id is None:
+            return None
+        return session.get(OperationalSession, state.active_session_id)
 
     def _common_risk_fields(self, state, data_is_stale: bool, clock_sync) -> dict:
         return dict(
@@ -211,12 +260,45 @@ class Orchestrator:
             state_ambiguous=state.state_ambiguous,
             cooldown_until=state.cooldown_until,
             now=utcnow(),
+            reconciliation_stale=state.reconciliation_stale,
+            operational_state=state.operational_state,
         )
 
-    def _run_ai_shadow(self, session, signal, signal_id: int, price: float) -> None:
+    def _run_ai_shadow(self, session, state, op_session, signal, signal_id: int, price: float) -> None:
+        """Fase 2, item 7.10: `market_context` gains session/position/risk
+        context beyond the base strategy params -- strictly ADDITIVE plain
+        data (no ORM objects, no execution/credential references), so the
+        AI Shadow boundary (app/ai_shadow/guard.py -- no import of
+        app.execution/pybit, no credential field names) stays intact."""
         if self.ai_agent is None:
             return
-        market_context = {**signal.params, "price": price}
+
+        position = None
+        open_pos = repo.open_positions(session, signal.symbol)
+        if open_pos:
+            p = open_pos[0]
+            position = {"side": p.side, "qty": p.qty, "avg_entry_price": p.avg_entry_price}
+
+        market_context = {
+            **signal.params,
+            "price": price,
+            "session": {
+                "mode": self.settings.mode.value,
+                "symbol": signal.symbol,
+                "operational_state": state.operational_state,
+                "session_uid": op_session.session_uid if op_session is not None else None,
+            },
+            "position": position,
+            "risk": {
+                "trading_blocked": state.trading_blocked,
+                "consecutive_losses": state.consecutive_losses,
+                "cooldown_until": state.cooldown_until.isoformat() if state.cooldown_until else None,
+            },
+            "metrics": {
+                "open_positions_count": len(open_pos),
+                "closed_positions_count": len(repo.closed_positions(session, signal.symbol)),
+            },
+        }
         result = self.ai_agent.observe(signal.symbol, market_context)
         if result is None:
             return
@@ -340,20 +422,22 @@ class Orchestrator:
         order_row = repo.save_order(
             session, key, risk_row.id, approved.symbol, approved.side, approved.qty,
             approved.stop_loss, approved.take_profit, mode=self.settings.mode.value, is_close=True,
+            reference_price=trigger_price,
         )
+        increment_session_counter(self._active_session(session, state), "orders_count")
 
         fill = self.execution_engine.submit(approved, key, reference_price=trigger_price)
-        order_row.status = fill.status
-        order_row.exchange_order_id = fill.exchange_order_id
+        self._apply_fill_to_order(session, state, order_row, fill)
 
-        if fill.status not in ("FILLED", "PARTIALLY_FILLED"):
+        if fill.status not in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
             state.api_failure_count += 1
             repo.record_failure(
                 session, "FAILURE",
-                f"Ordem de fechamento {order_row.id} terminou com status={fill.status}.",
+                f"Ordem de fechamento {order_row.id} terminou com status={fill.status.value}.",
             )
+            increment_session_counter(self._active_session(session, state), "failures_count")
             self.reconcile(session, state)
-            return {"status": "close_failed", "order_status": fill.status, "order_id": order_row.id}
+            return {"status": "close_failed", "order_status": fill.status.value, "order_id": order_row.id}
 
         repo.save_execution(session, order_row.id, fill.fill_qty, fill.fill_price, fill.fee, fill.is_partial)
 
@@ -397,13 +481,14 @@ class Orchestrator:
         order_row = repo.save_order(
             session, key, risk_evaluation_id, approved.symbol, approved.side, approved.qty,
             approved.stop_loss, approved.take_profit, mode=self.settings.mode.value, is_close=False,
+            reference_price=candle_close,
         )
+        increment_session_counter(self._active_session(session, state), "orders_count")
 
         fill = self.execution_engine.submit(approved, key, reference_price=candle_close)
-        order_row.status = fill.status
-        order_row.exchange_order_id = fill.exchange_order_id
+        self._apply_fill_to_order(session, state, order_row, fill)
 
-        if fill.status in ("FILLED", "PARTIALLY_FILLED"):
+        if fill.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
             repo.save_execution(session, order_row.id, fill.fill_qty, fill.fill_price, fill.fee, fill.is_partial)
             repo.open_position(
                 session, approved.symbol, approved.side, fill.fill_qty, fill.fill_price,
@@ -412,21 +497,55 @@ class Orchestrator:
             return {"status": "order_filled", "order_id": order_row.id}
 
         state.api_failure_count += 1
-        repo.record_failure(session, "FAILURE", f"Ordem {order_row.id} terminou com status={fill.status}.")
+        repo.record_failure(session, "FAILURE", f"Ordem {order_row.id} terminou com status={fill.status.value}.")
+        increment_session_counter(self._active_session(session, state), "failures_count")
         self.reconcile(session, state)
-        return {"status": "order_not_filled", "order_status": fill.status}
+        return {"status": "order_not_filled", "order_status": fill.status.value}
+
+    def _apply_fill_to_order(self, session, state, order_row, fill) -> None:
+        """Fase 2, item 7.2: books `fill` onto `order_row` through the
+        enforced state machine (never a bare `order_row.status = ...`
+        assignment). FILLED/PARTIALLY_FILLED go through `record_fill`
+        (cumulative bookkeeping); REJECTED/UNKNOWN transition directly --
+        both are legal successors of PENDING_SUBMIT (see
+        app.execution.order_state). Always re-derives
+        SystemState.order_state_unknown afterward, since an order landing
+        in (or leaving) UNKNOWN changes whether new exposure may be opened.
+        """
+        order_row.exchange_order_id = fill.exchange_order_id
+        op_session = self._active_session(session, state)
+        if fill.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
+            repo.record_fill(
+                session, order_row, fill.status,
+                cumulative_filled_qty=fill.fill_qty, avg_fill_price=fill.fill_price,
+                fees_total=fill.fee,
+            )
+            increment_session_counter(op_session, "fills_count")
+        else:
+            repo.transition_order_status(
+                session, order_row, fill.status,
+                detail=f"Resultado de submit(): {fill.status.value}.",
+            )
+        state.order_state_unknown = repo.has_unknown_orders(session)
+        repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
 
     def reconcile(self, session, state) -> None:
         """Compares locally persisted OPEN positions against what the
         execution engine reports for the exchange. Runs at orchestrator
-        construction time (startup / after a restart), and again whenever an
-        order submission ends in an unresolved/error status -- see callers
-        above. Any mismatch, or failure to even reach the exchange, sets
-        state_ambiguous=True; TRADING_BLOCKED is then derived by
+        construction time (startup / after a restart), whenever an order
+        submission ends in an unresolved/error status, and now also
+        periodically (Fase 2, item 7.4 -- see the top of `tick()`). Any
+        mismatch, or failure to even reach the exchange, sets
+        state_ambiguous=True (unchanged since Fase 1) AND the new, more
+        specifically-named `reconciliation_diverged` flag (Fase 2, item
+        7.5) in parallel -- TRADING_BLOCKED is then derived by
         repo.recompute_trading_blocked() alongside every other block source
         (correction v1.2 #5), so disengaging the kill switch can never clear
-        a block caused by a reconciliation problem.
+        a block caused by a reconciliation problem. `last_reconciliation_at`
+        is always stamped, whatever the outcome, so staleness tracking
+        reflects the most recent attempt, not just the most recent success.
         """
+        increment_session_counter(self._active_session(session, state), "reconciliations_count")
         local_positions = [
             {"symbol": p.symbol, "side": p.side, "qty": p.qty}
             for p in repo.open_positions(session)
@@ -440,6 +559,8 @@ class Orchestrator:
                 remote_by_symbol[symbol] = self.execution_engine.get_position(symbol)
         except Exception as exc:  # noqa: BLE001 - any failure to verify blocks trading
             state.state_ambiguous = True
+            state.reconciliation_diverged = True
+            state.last_reconciliation_at = utcnow()
             repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
             detail = f"Não foi possível consultar as posições na corretora para reconciliação: {exc}"
             repo.record_failure(session, "RECONCILIATION", detail)
@@ -447,8 +568,16 @@ class Orchestrator:
             return
 
         report = reconcile_positions(local_positions, remote_by_symbol)
+        state.last_reconciliation_at = utcnow()
+        # Fase 2, item 7.7/7.8: a reconciliation that actually COMPLETED
+        # (reached the exchange and compared, whether or not it found a
+        # mismatch) satisfies the "reconciliação inicial concluída" gate --
+        # the exception branch above does NOT reach here, so it correctly
+        # never clears this.
+        state.initialization_not_reconciled = False
         if report.ok:
             state.state_ambiguous = False
+            state.reconciliation_diverged = False
             repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
             repo.record_failure(
                 session, "RECONCILIATION",
@@ -457,6 +586,7 @@ class Orchestrator:
             )
         else:
             state.state_ambiguous = True
+            state.reconciliation_diverged = True
             repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
             detail = "Divergência de reconciliação: " + "; ".join(report.mismatches)
             repo.record_failure(session, "RECONCILIATION", detail)

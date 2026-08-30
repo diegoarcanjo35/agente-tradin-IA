@@ -162,6 +162,9 @@ def test_bybit_demo_pipeline_reaches_execution_engine_with_zero_network():
     transport = _KlineSequenceTransport(base_transport, rows)
 
     orch = build_orchestrator(settings, bybit_transport=transport)
+    from tests.factories import activate_operational_state
+
+    activate_operational_state(orch)  # Fase 2, item 7.8: entries require explicit activation
 
     results = []
     for _ in range(len(rows) + 2):

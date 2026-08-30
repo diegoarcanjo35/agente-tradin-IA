@@ -35,6 +35,15 @@ Schema history:
             first, keeping the earliest-inserted (lowest id) row as the
             canonical record, deterministically and before the index is
             created.
+  v2 -> v3  (Fase 2 v1.0): adds the order status state machine bookkeeping
+            (orders.filled_qty/avg_fill_price/fees_total, the order_events
+            audit table), operational sessions (operational_sessions
+            table), and the new independent SystemState block-cause flags
+            (reconciliation_diverged, reconciliation_stale,
+            order_state_unknown, initialization_not_reconciled,
+            last_reconciliation_at, operational_state, active_session_id),
+            plus optional order_id/session_id links on
+            failures_reconciliations.
 """
 from __future__ import annotations
 
@@ -47,7 +56,7 @@ from sqlalchemy.engine import Connection, Engine
 
 from app.persistence.models import Base
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 class MigrationError(Exception):
@@ -225,10 +234,88 @@ def _migrate_to_v2(conn: Connection) -> None:
         ))
 
 
+def _migrate_to_v3(conn: Connection) -> None:
+    """Correction v1.2 -> Fase 2 v1.0 schema."""
+    # New tables -- CREATE TABLE IF NOT EXISTS is inherently idempotent, no
+    # existence guard needed (unlike ALTER TABLE ADD COLUMN below).
+    conn.execute(text(
+        "CREATE TABLE IF NOT EXISTS operational_sessions ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "session_uid VARCHAR(36) NOT NULL, "
+        "mode VARCHAR(16) NOT NULL, "
+        "symbol VARCHAR(32) NOT NULL, "
+        "timeframe VARCHAR(8) NOT NULL, "
+        "started_at DATETIME NOT NULL, "
+        "ended_at DATETIME, "
+        "end_reason VARCHAR(255), "
+        "strategy_version VARCHAR(64) NOT NULL, "
+        "risk_config_json TEXT NOT NULL, "
+        "config_snapshot_json TEXT NOT NULL, "
+        "status VARCHAR(16) NOT NULL DEFAULT 'INICIALIZANDO', "
+        "candles_count INTEGER NOT NULL DEFAULT 0, "
+        "signals_count INTEGER NOT NULL DEFAULT 0, "
+        "approvals_count INTEGER NOT NULL DEFAULT 0, "
+        "rejections_count INTEGER NOT NULL DEFAULT 0, "
+        "orders_count INTEGER NOT NULL DEFAULT 0, "
+        "fills_count INTEGER NOT NULL DEFAULT 0, "
+        "failures_count INTEGER NOT NULL DEFAULT 0, "
+        "reconciliations_count INTEGER NOT NULL DEFAULT 0"
+        ")"
+    ))
+    conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_operational_sessions_session_uid "
+        "ON operational_sessions (session_uid)"
+    ))
+    conn.execute(text(
+        "CREATE TABLE IF NOT EXISTS order_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "order_id INTEGER NOT NULL, "
+        "from_status VARCHAR(16) NOT NULL, "
+        "to_status VARCHAR(16) NOT NULL, "
+        "detail TEXT, "
+        "created_at DATETIME NOT NULL"
+        ")"
+    ))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_order_events_order_id ON order_events (order_id)"))
+
+    # orders: cumulative fill bookkeeping + the reference price used for
+    # slippage tracking (item 7.6).
+    for column, ddl_type in (
+        ("filled_qty", "FLOAT NOT NULL DEFAULT 0"),
+        ("avg_fill_price", "FLOAT NOT NULL DEFAULT 0"),
+        ("fees_total", "FLOAT NOT NULL DEFAULT 0"),
+        ("reference_price", "FLOAT"),
+    ):
+        if not _column_exists(conn, "orders", column):
+            conn.execute(text(f"ALTER TABLE orders ADD COLUMN {column} {ddl_type}"))
+
+    # failures_reconciliations: optional links to order/session.
+    if not _column_exists(conn, "failures_reconciliations", "order_id"):
+        conn.execute(text("ALTER TABLE failures_reconciliations ADD COLUMN order_id INTEGER"))
+    if not _column_exists(conn, "failures_reconciliations", "session_id"):
+        conn.execute(text("ALTER TABLE failures_reconciliations ADD COLUMN session_id INTEGER"))
+
+    # system_state: new independent block-cause flags + operational state.
+    for column, ddl_type in (
+        ("reconciliation_diverged", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("reconciliation_stale", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("order_state_unknown", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("initialization_not_reconciled", "BOOLEAN NOT NULL DEFAULT 1"),
+        ("last_reconciliation_at", "DATETIME"),
+        ("operational_state", "VARCHAR(16) NOT NULL DEFAULT 'INICIALIZANDO'"),
+        ("active_session_id", "INTEGER"),
+    ):
+        if not _column_exists(conn, "system_state", column):
+            conn.execute(text(f"ALTER TABLE system_state ADD COLUMN {column} {ddl_type}"))
+
+
 # Order matters: applied strictly in ascending version order.
 MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
     (1, "Adiciona system_state.state_ambiguous, orders.is_close; relaxa orders.stop_loss para opcional.", _migrate_to_v1),
     (2, "Adiciona system_state.clock_out_of_sync; cria índice único em candles (dedup determinístico antes).", _migrate_to_v2),
+    (3, "Adiciona máquina de estados de ordens (filled_qty/avg_fill_price/fees_total, order_events), "
+        "sessões operacionais (operational_sessions) e novas causas independentes de bloqueio em system_state.",
+     _migrate_to_v3),
 ]
 
 
@@ -253,9 +340,31 @@ def _v2_invariants_satisfied(conn: Connection) -> bool:
     )
 
 
+def _v3_invariants_satisfied(conn: Connection) -> bool:
+    """ALL structural invariants of v3 (Fase 2 v1.0)."""
+    return (
+        _table_exists(conn, "operational_sessions")
+        and _table_exists(conn, "order_events")
+        and _column_exists(conn, "orders", "filled_qty")
+        and _column_exists(conn, "orders", "avg_fill_price")
+        and _column_exists(conn, "orders", "fees_total")
+        and _column_exists(conn, "orders", "reference_price")
+        and _column_exists(conn, "failures_reconciliations", "order_id")
+        and _column_exists(conn, "failures_reconciliations", "session_id")
+        and _column_exists(conn, "system_state", "reconciliation_diverged")
+        and _column_exists(conn, "system_state", "reconciliation_stale")
+        and _column_exists(conn, "system_state", "order_state_unknown")
+        and _column_exists(conn, "system_state", "initialization_not_reconciled")
+        and _column_exists(conn, "system_state", "last_reconciliation_at")
+        and _column_exists(conn, "system_state", "operational_state")
+        and _column_exists(conn, "system_state", "active_session_id")
+    )
+
+
 _VERSION_INVARIANTS: dict[int, Callable[[Connection], bool]] = {
     1: _v1_invariants_satisfied,
     2: _v2_invariants_satisfied,
+    3: _v3_invariants_satisfied,
 }
 
 

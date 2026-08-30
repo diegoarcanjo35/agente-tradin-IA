@@ -1,6 +1,6 @@
 # Operação em Bybit Demo
 
-## Gerando credenciais Demo/Testnet
+## Gerando credenciais Bybit Demo Trading
 
 1. Acesse o ambiente **Bybit Demo Trading** (não confundir com a conta
    principal/produção) — a Bybit disponibiliza um modo "Demo Trading"
@@ -12,8 +12,8 @@
    que executará o agente.
 5. Copie `.env.example` para `.env` e preencha `BYBIT_API_KEY` /
    `BYBIT_API_SECRET`. Confirme que `BYBIT_BASE_URL` e `BYBIT_WS_URL`
-   continuam apontando para hosts demo/testnet — o sistema recusa iniciar
-   caso contrário (ver `docs/SEGURANCA.md`).
+   continuam apontando para hosts Bybit Demo Trading — o sistema recusa
+   iniciar caso contrário (ver `docs/SEGURANCA.md`).
 
 ## Iniciando sem credenciais (REPLAY)
 
@@ -42,9 +42,19 @@ origem local ou `CONTROL_API_TOKEN` para *desativar* o bloqueio (ver
 ## Modos disponíveis
 
 - `REPLAY` (padrão): dados de um arquivo local, execução simulada, zero rede.
-- `PAPER_LOCAL`: mesma fonte de dados de `REPLAY` nesta fase (pode ser trocada
-  por um feed ao vivo somente-leitura no futuro), execução simulada local
+- `PAPER_LOCAL`: mesma fonte de dados de `REPLAY`, execução simulada local
   com taxa e slippage configuráveis, sem enviar ordens à Bybit.
+- `PAPER_LIVE` (Fase 2, item 7.1): dados **reais** de mercado do Bybit Demo
+  Trading (só endpoints públicos — `GET /v5/market/kline`,
+  `GET /v5/market/time` — nunca exige `BYBIT_API_KEY`/`SECRET`), execução
+  100% local via `PaperLocalExecutionEngine` — nunca constrói
+  `BybitDemoExecutionEngine` nem chama um endpoint privado da corretora.
+  Reaproveita a mesma paginação `start`+`end`, seleção de candle fechado,
+  cursor persistido e detecção de lacunas do `BYBIT_DEMO`. Usa o mesmo
+  `BYBIT_POLL_INTERVAL_SECONDS` do `BYBIT_DEMO` (dados reais têm limite de
+  requisição real mesmo com execução simulada). Painel mostra o banner
+  `"PAPER AO VIVO — SIMULAÇÃO, SEM ORDEM NA CORRETORA"`, distinto do banner
+  genérico dos demais modos. Ver `docs/FASE_2.md`.
 - `BYBIT_DEMO`: dados e ordens reais contra o ambiente oficial **Bybit Demo
   Trading**. Exige `BYBIT_API_KEY`/`BYBIT_API_SECRET` e recusa iniciar se o
   host configurado não estiver na allowlist.

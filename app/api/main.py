@@ -23,7 +23,10 @@ from app.persistence.db import init_db, make_engine, make_session_factory, sessi
 from app.persistence import repo
 from app.risk.engine import RiskEngine
 from app.risk.config import RiskLimits
+from app.sessions import start_or_resume_session
 from app.strategy.engine import StrategyEngine
+
+STRATEGY_VERSION = "v1"
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 FIXTURES_DIR = BASE_DIR / "fixtures"
@@ -80,6 +83,30 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator:
         )
         execution_engine = PaperLocalExecutionEngine(price_provider=price_provider)
         clock_provider = ReplayClockProvider(drift_seconds=0.0)
+    elif settings.mode == RunMode.PAPER_LIVE:
+        # Fase 2, item 7.1: REAL Bybit Demo market data (public endpoints
+        # only), execution stays entirely local/simulated. Deliberately
+        # never calls require_bybit_credentials(), never builds an
+        # authenticated pybit client or http_post, and never constructs
+        # BybitDemoExecutionEngine -- PAPER_LIVE cannot reach the exchange's
+        # private order-management endpoints even if this code had a bug,
+        # because PaperLocalExecutionEngine (below) simply has no code path
+        # that calls http_post at all.
+        from app.execution.bybit_pybit_client import PybitTransport, build_public_pybit_client
+        from app.market_data.bybit_provider import BybitDemoMarketDataProvider, BybitServerTimeProvider
+
+        if bybit_transport is not None:
+            transport = bybit_transport
+        else:
+            pybit_client = build_public_pybit_client(settings.bybit_base_url, settings.bybit_ws_url)
+            transport = PybitTransport(pybit_client)
+
+        market_data_provider = BybitDemoMarketDataProvider(
+            settings.bybit_base_url, settings.symbol, "1", http_get=transport.http_get,
+            initial_start=settings.market_data_initial_start,
+        )
+        execution_engine = PaperLocalExecutionEngine(price_provider=price_provider)
+        clock_provider = BybitServerTimeProvider(settings.bybit_base_url, http_get=transport.http_get)
     else:  # BYBIT_DEMO
         from app.execution.bybit_demo import BybitDemoExecutionEngine
         from app.execution.bybit_pybit_client import PybitTransport, build_pybit_client
@@ -136,7 +163,22 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator:
     # trading immediately rather than trusting stale local state.
     with session_scope(session_factory) as session:
         state = repo.get_or_create_system_state(session)
+
+        # Fase 2, item 7.7: create or resume the operational session for
+        # this exact mode+symbol BEFORE the startup reconciliation below, so
+        # that reconciliation is itself counted in reconciliations_count.
+        # Item 7.8: a session/process only ever comes up as OBSERVANDO
+        # (monitoring, reconciling, able to close/reduce exposure) -- never
+        # ATIVO. Opening new entries always requires an explicit
+        # POST /operational-state/activate afterward, regardless of mode or
+        # how clean the startup reconciliation was.
+        op_session = start_or_resume_session(session, settings, STRATEGY_VERSION, risk_limits)
+        state.active_session_id = op_session.id
+
         orchestrator.reconcile(session, state)
+
+        state.operational_state = "BLOQUEADO" if state.trading_blocked else "OBSERVANDO"
+        op_session.status = state.operational_state
 
     return orchestrator
 
@@ -149,9 +191,13 @@ async def _poll_loop(app: FastAPI) -> None:
     orchestrator instead of silently killing the background task."""
     orch = app.state.orchestrator
     settings = app.state.settings
+    # Fase 2, item 7.1: PAPER_LIVE polls real Bybit market data, so it needs
+    # the real rate-limit-aware cadence too, even though execution is
+    # simulated -- only REPLAY/PAPER_LOCAL (fixture data, no network) use
+    # the fast interval.
     interval = (
         settings.bybit_poll_interval_seconds
-        if settings.mode == RunMode.BYBIT_DEMO
+        if settings.mode in (RunMode.BYBIT_DEMO, RunMode.PAPER_LIVE)
         else settings.replay_poll_interval_seconds
     )
     while True:

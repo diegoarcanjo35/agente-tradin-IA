@@ -55,6 +55,11 @@ KNOWN_PRODUCTION_BYBIT_HOSTS = frozenset(
 class RunMode(str, Enum):
     REPLAY = "REPLAY"
     PAPER_LOCAL = "PAPER_LOCAL"
+    # Fase 2, item 7.1: real Bybit Demo market data (public endpoints only,
+    # no credentials, no private client), execution stays entirely local/
+    # simulated -- never reaches BybitDemoExecutionEngine. See
+    # app/api/main.py::build_orchestrator's PAPER_LIVE branch.
+    PAPER_LIVE = "PAPER_LIVE"
     BYBIT_DEMO = "BYBIT_DEMO"
 
 
@@ -134,6 +139,16 @@ class Settings(BaseSettings):
     # timezone-aware candle timestamps from Bybit). See docs/OPERACAO_DEMO.md
     # for the accepted formats and the policy for values with no timezone.
     market_data_initial_start: datetime | None = Field(default=None)
+
+    # Fase 2, item 7.4: reconciliation used to run only at startup or right
+    # after an order ended in a non-filled status. It now also runs
+    # periodically, on a configurable cadence -- and if it falls behind that
+    # cadence by more than the configured delay, new (opening) entries are
+    # blocked via SystemState.reconciliation_stale until a fresh
+    # reconciliation clears it. Closing/reducing exposure is never blocked
+    # by staleness.
+    reconciliation_interval_seconds: float = Field(default=300.0)
+    reconciliation_max_delay_seconds: float = Field(default=900.0)
 
     # Risk defaults (conservative). See app/risk/config.py for the dataclass
     # these seed and full documentation of each limit.

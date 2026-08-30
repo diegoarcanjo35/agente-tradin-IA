@@ -10,9 +10,29 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from app.persistence import repo
+from app.persistence.db import session_scope
 from app.risk.config import RiskLimits
 from app.risk.engine import ApprovedOrder, RiskContext, RiskEngine
 from app.strategy.schemas import Signal
+
+
+def activate_operational_state(orchestrator) -> None:
+    """Fase 2, item 7.8: a freshly built Orchestrator always comes up in
+    OBSERVANDO, never ATIVO -- new entries require explicit operator
+    activation (POST /operational-state/activate in production). Tests
+    that need entries to actually fill call this directly, bypassing the
+    HTTP layer, exactly like they bypass it for every other white-box
+    orchestrator check in this suite."""
+    with session_scope(orchestrator.session_factory) as session:
+        state = repo.get_or_create_system_state(session)
+        state.operational_state = "ATIVO"
+        if state.active_session_id is not None:
+            from app.persistence.models import OperationalSession
+
+            op_session = session.get(OperationalSession, state.active_session_id)
+            if op_session is not None:
+                op_session.status = "ATIVO"
 
 NOW = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
 
