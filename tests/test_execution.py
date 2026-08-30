@@ -9,13 +9,14 @@ import pytest
 from app.execution.bybit_demo import BybitDemoExecutionEngine
 from app.execution.idempotency import make_idempotency_key
 from app.execution.paper_local import PaperLocalExecutionEngine
-from app.risk.engine import ApprovedOrder, RiskEngine
+from app.risk.engine import ApprovedOrder
+from tests.factories import approved_open_order
 from tests.fakes.bybit_fake import FakeBybitTransport
 
 
 def make_order(qty=0.001) -> ApprovedOrder:
-    return RiskEngine.make_test_approved_order(
-        signal_id=1, symbol="BTCUSDT", side="BUY", qty=qty,
+    return approved_open_order(
+        symbol="BTCUSDT", side="BUY", qty=qty, price=40000.0,
         stop_loss=39000.0, take_profit=41000.0,
     )
 

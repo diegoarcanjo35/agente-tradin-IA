@@ -20,7 +20,7 @@ from app.core.logging import get_logger, log_event
 from app.execution.base import ExecutionEngine
 from app.execution.idempotency import make_idempotency_key
 from app.execution.reconciliation import reconcile_positions
-from app.market_data.base import MarketDataProvider
+from app.market_data.base import CandleFetchStatus, MarketDataProvider
 from app.persistence import repo
 from app.risk.engine import RiskContext, RiskEngine
 from app.strategy.engine import StrategyEngine
@@ -64,14 +64,50 @@ class Orchestrator:
         with session_scope(self.session_factory) as session:
             state = repo.get_or_create_system_state(session)
 
-            candle = self.market_data_provider.next_candle()
-            if candle is None:
+            fetch_result = self.market_data_provider.next_candle()
+
+            if fetch_result.status == CandleFetchStatus.REPLAY_FINISHED:
+                # The ONLY status allowed to end the orchestrator's loop.
                 return {"status": "no_data"}
 
-            repo.save_candle(
+            if fetch_result.status == CandleFetchStatus.NO_NEW_CANDLE:
+                return {"status": "no_new_candle"}
+
+            if fetch_result.status == CandleFetchStatus.RETRYABLE_ERROR:
+                state.api_failure_count += 1
+                repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
+                detail = fetch_result.detail or "Falha temporária ao consultar dados de mercado."
+                repo.record_failure(session, "FAILURE", detail)
+                if state.trading_blocked:
+                    repo.record_security_event(
+                        session, "API_FAILURE_LIMIT_REACHED",
+                        f"Bloqueio automático após {state.api_failure_count} falhas consecutivas de API.",
+                    )
+                return {"status": "retryable_error", "detail": detail}
+
+            if fetch_result.status == CandleFetchStatus.FATAL_ERROR:
+                state.api_failure_count += 1
+                repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
+                detail = fetch_result.detail or "Falha grave e não recuperável ao consultar dados de mercado."
+                repo.record_failure(session, "FAILURE", detail)
+                repo.record_security_event(session, "FATAL_MARKET_DATA_ERROR", detail)
+                return {"status": "fatal_error", "detail": detail}
+
+            candle = fetch_result.candle
+            saved = repo.save_candle(
                 session, candle.symbol, candle.timeframe, candle.open_time,
                 candle.open, candle.high, candle.low, candle.close, candle.volume, candle.source,
             )
+            if saved is None:
+                # Correction v1.2 #2: a concurrent/duplicate write for the
+                # same symbol+timeframe+open_time is a no-op, never a crash,
+                # and never re-triggers strategy/AI/risk processing.
+                return {"status": "duplicate_candle"}
+
+            # A fresh candle was received and persisted: the API is healthy.
+            state.api_failure_count = 0
+            repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
+
             self.price_state[candle.symbol] = candle.close
 
             signal = self.strategy_engine.on_candle(candle)
@@ -87,10 +123,14 @@ class Orchestrator:
             )
 
             clock_sync = compute_clock_sync(self.clock_provider, self.settings.risk_max_clock_drift_seconds)
-            if not clock_sync.ok:
-                state.trading_blocked = True
-                state.block_reason = f"CLOCK_DRIFT: {clock_sync.error}"
-                repo.record_security_event(session, "CLOCK_DRIFT_BLOCKED", clock_sync.error or "unknown")
+            was_out_of_sync = state.clock_out_of_sync
+            state.clock_out_of_sync = not clock_sync.ok
+            if not clock_sync.ok and not was_out_of_sync:
+                repo.record_security_event(
+                    session, "CLOCK_DRIFT_BLOCKED",
+                    clock_sync.error or "Relógio local fora de sincronia; motivo desconhecido.",
+                )
+            repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
 
             stop_take_result = self._check_stop_take(session, state, candle, data_is_stale, clock_sync)
             if stop_take_result is not None:
@@ -164,7 +204,7 @@ class Orchestrator:
         else:
             repo.save_ai_recommendation(
                 session, signal.symbol, signal_id, "HOLD", 0.0,
-                "invalid or unavailable AI output", [], result.provider_name,
+                "Saída da IA inválida ou indisponível.", [], result.provider_name,
                 result.model_version, False, result.rejection_reason,
             )
 
@@ -197,20 +237,20 @@ class Orchestrator:
             trigger_price = position.stop_loss
             trigger_kind = "stop_loss"
             justification = (
-                f"Stop-loss touched: candle range [{candle.low}, {candle.high}] crossed "
-                f"stop {position.stop_loss}."
+                f"Stop-loss atingido: a faixa do candle [{candle.low}, {candle.high}] "
+                f"cruzou o stop em {position.stop_loss}."
             )
             if target_hit:
                 justification += (
-                    " Take-profit was also touched in the same candle; conservative rule "
-                    "assumes the stop-loss triggered first."
+                    " O take-profit também foi tocado no mesmo candle; a regra "
+                    "conservadora assume que o stop-loss foi acionado primeiro."
                 )
         else:
             trigger_price = position.take_profit
             trigger_kind = "take_profit"
             justification = (
-                f"Take-profit touched: candle range [{candle.low}, {candle.high}] crossed "
-                f"target {position.take_profit}."
+                f"Take-profit atingido: a faixa do candle [{candle.low}, {candle.high}] "
+                f"cruzou o alvo em {position.take_profit}."
             )
 
         close_side = "SELL" if position.side == "BUY" else "BUY"
@@ -282,7 +322,10 @@ class Orchestrator:
 
         if fill.status not in ("FILLED", "PARTIALLY_FILLED"):
             state.api_failure_count += 1
-            repo.record_failure(session, "FAILURE", f"Close order {order_row.id} ended in status={fill.status}")
+            repo.record_failure(
+                session, "FAILURE",
+                f"Ordem de fechamento {order_row.id} terminou com status={fill.status}.",
+            )
             self.reconcile(session, state)
             return {"status": "close_failed", "order_status": fill.status, "order_id": order_row.id}
 
@@ -306,7 +349,8 @@ class Orchestrator:
                 state.cooldown_until = utcnow() + timedelta(minutes=self.settings.risk_cooldown_minutes)
                 repo.record_security_event(
                     session, "COOLDOWN_ENGAGED",
-                    f"{state.consecutive_losses} consecutive losses; cooldown until {state.cooldown_until.isoformat()}.",
+                    f"{state.consecutive_losses} perdas consecutivas; cooldown até "
+                    f"{state.cooldown_until.isoformat()}.",
                 )
                 log_event(logger, 30, "cooldown_engaged", consecutive_losses=state.consecutive_losses)
 
@@ -342,7 +386,7 @@ class Orchestrator:
             return {"status": "order_filled", "order_id": order_row.id}
 
         state.api_failure_count += 1
-        repo.record_failure(session, "FAILURE", f"Order {order_row.id} ended in status={fill.status}")
+        repo.record_failure(session, "FAILURE", f"Ordem {order_row.id} terminou com status={fill.status}.")
         self.reconcile(session, state)
         return {"status": "order_not_filled", "order_status": fill.status}
 
@@ -352,8 +396,10 @@ class Orchestrator:
         construction time (startup / after a restart), and again whenever an
         order submission ends in an unresolved/error status -- see callers
         above. Any mismatch, or failure to even reach the exchange, sets
-        TRADING_BLOCKED and state_ambiguous=True; both the Risk Engine's
-        common gates check state_ambiguous before approving anything.
+        state_ambiguous=True; TRADING_BLOCKED is then derived by
+        repo.recompute_trading_blocked() alongside every other block source
+        (correction v1.2 #5), so disengaging the kill switch can never clear
+        a block caused by a reconciliation problem.
         """
         local_positions = [
             {"symbol": p.symbol, "side": p.side, "qty": p.qty}
@@ -368,26 +414,24 @@ class Orchestrator:
                 remote_by_symbol[symbol] = self.execution_engine.get_position(symbol)
         except Exception as exc:  # noqa: BLE001 - any failure to verify blocks trading
             state.state_ambiguous = True
-            state.trading_blocked = True
-            state.block_reason = f"RECONCILIATION_MISMATCH: could not query exchange positions ({exc})."
-            repo.record_failure(session, "RECONCILIATION", state.block_reason)
-            repo.record_security_event(session, "RECONCILIATION_FAILED", str(exc))
+            repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
+            detail = f"Não foi possível consultar as posições na corretora para reconciliação: {exc}"
+            repo.record_failure(session, "RECONCILIATION", detail)
+            repo.record_security_event(session, "RECONCILIATION_FAILED", detail)
             return
 
         report = reconcile_positions(local_positions, remote_by_symbol)
         if report.ok:
-            was_ambiguous = state.state_ambiguous
             state.state_ambiguous = False
-            if was_ambiguous and state.block_reason and state.block_reason.startswith("RECONCILIATION_MISMATCH"):
-                state.trading_blocked = False
-                state.block_reason = None
+            repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
             repo.record_failure(
-                session, "RECONCILIATION", "Reconciliation OK: local and exchange positions match.",
+                session, "RECONCILIATION",
+                "Reconciliação OK: posições locais e da corretora coincidem.",
                 resolved=True,
             )
         else:
             state.state_ambiguous = True
-            state.trading_blocked = True
-            state.block_reason = "RECONCILIATION_MISMATCH: " + "; ".join(report.mismatches)
-            repo.record_failure(session, "RECONCILIATION", state.block_reason)
-            repo.record_security_event(session, "RECONCILIATION_MISMATCH", state.block_reason)
+            repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
+            detail = "Divergência de reconciliação: " + "; ".join(report.mismatches)
+            repo.record_failure(session, "RECONCILIATION", detail)
+            repo.record_security_event(session, "RECONCILIATION_MISMATCH", detail)

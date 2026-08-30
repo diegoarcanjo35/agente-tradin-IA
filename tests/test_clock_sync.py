@@ -104,7 +104,8 @@ def test_orchestrator_blocks_new_orders_when_clock_drift_exceeds_limit(session_f
     with session_scope(session_factory) as session:
         state = repo.get_or_create_system_state(session)
         assert state.trading_blocked is True
-        assert state.block_reason is not None and "CLOCK_DRIFT" in state.block_reason
+        assert state.clock_out_of_sync is True
+        assert state.block_reason is not None and "relógio" in state.block_reason.lower()
 
         events = repo.recent_security_events(session, limit=10)
         assert any(e.event_type == "CLOCK_DRIFT_BLOCKED" for e in events)

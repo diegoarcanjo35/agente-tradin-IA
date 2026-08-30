@@ -20,17 +20,21 @@ def reconcile_positions(local_positions: list[dict], remote_positions_by_symbol:
     for symbol, local in local_by_symbol.items():
         remote = remote_positions_by_symbol.get(symbol)
         if remote is None:
-            mismatches.append(f"{symbol}: local OPEN position but exchange reports none.")
+            mismatches.append(f"{symbol}: posição local aberta, mas a corretora não reporta nenhuma (exchange reports none).")
             continue
         if abs(remote["qty"] - local["qty"]) > 1e-9:
             mismatches.append(
-                f"{symbol}: qty mismatch local={local['qty']} remote={remote['qty']}."
+                f"{symbol}: divergência de quantidade (qty mismatch) local={local['qty']} corretora={remote['qty']}."
             )
         if remote["side"] != local["side"]:
-            mismatches.append(f"{symbol}: side mismatch local={local['side']} remote={remote['side']}.")
+            mismatches.append(
+                f"{symbol}: divergência de lado (side mismatch) local={local['side']} corretora={remote['side']}."
+            )
 
     for symbol, remote in remote_positions_by_symbol.items():
         if remote is not None and symbol not in local_by_symbol:
-            mismatches.append(f"{symbol}: exchange reports an open position with no local record.")
+            mismatches.append(
+                f"{symbol}: a corretora reporta uma posição aberta sem registro local (no local record)."
+            )
 
     return ReconciliationReport(ok=not mismatches, mismatches=mismatches)

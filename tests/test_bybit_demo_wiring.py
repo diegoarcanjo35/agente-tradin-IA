@@ -7,6 +7,8 @@ No mock replaces build_orchestrator() itself or any internal wiring code.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from app.api.main import build_orchestrator
@@ -14,6 +16,8 @@ from app.core.config import RunMode, Settings
 from app.execution.bybit_demo import BybitDemoExecutionEngine
 from app.market_data.bybit_provider import BybitDemoMarketDataProvider, BybitServerTimeProvider
 from app.orchestrator import Orchestrator
+from app.persistence import repo
+from app.persistence.db import session_scope
 from tests.fakes.bybit_fake import FakeBybitTransport
 
 
@@ -59,32 +63,128 @@ def test_bybit_demo_requires_credentials_before_any_transport_is_built():
         build_orchestrator(settings, bybit_transport=FakeBybitTransport())
 
 
+def _generate_kline_rows(n_down: int, n_up: int) -> list[list[str]]:
+    """Deterministic downtrend-then-rally sequence, long enough for the
+    DEFAULT StrategyEngine config (fast=9/slow=21/atr=14) to actually
+    produce a bullish crossover -- real past timestamps (minutes before
+    "now") so BybitDemoMarketDataProvider's closed-candle check passes with
+    its default now_fn=utcnow, no clock injection needed."""
+    start = datetime.now(timezone.utc) - timedelta(minutes=n_down + n_up + 5)
+    rows: list[list[str]] = []
+    price = 100.0
+    for i in range(n_down):
+        price -= 1.0
+        open_time = start + timedelta(minutes=i)
+        rows.append([
+            str(int(open_time.timestamp() * 1000)),
+            f"{price + 1:.2f}", f"{price + 2:.2f}", f"{price - 1:.2f}", f"{price:.2f}", "10", "0",
+        ])
+    for j in range(n_up):
+        price += 2.0
+        open_time = start + timedelta(minutes=n_down + j)
+        # A gentle rally slope keeps ATR% (true range relative to price)
+        # under the strategy's 5% volatility ceiling all the way through
+        # the crossover -- a steep rally previously pushed ATR% just over
+        # that ceiling right at the crossover candle, silently forcing HOLD.
+        rows.append([
+            str(int(open_time.timestamp() * 1000)),
+            f"{price - 2:.2f}", f"{price + 1:.2f}", f"{price - 3:.2f}", f"{price:.2f}", "10", "0",
+        ])
+    return rows
+
+
+class _KlineSequenceTransport:
+    """Wraps FakeBybitTransport, serving one queued kline row per GET call
+    (mirroring Bybit's real limit=1 "latest candle" semantics) while
+    delegating order create/status/position calls to the real fake -- so
+    order submission is genuinely exercised, not mocked."""
+
+    def __init__(self, base: FakeBybitTransport, rows: list[list[str]]):
+        self._base = base
+        self._rows = rows
+        self._idx = 0
+        self.get_calls = base.get_calls
+        self.post_calls = base.post_calls
+
+    def http_get(self, url: str, params: dict) -> dict:
+        if url.endswith("/v5/market/kline"):
+            if self._idx >= len(self._rows):
+                return {"result": {"list": []}}
+            row = self._rows[self._idx]
+            self._idx += 1
+            return {"result": {"list": [row]}}
+        if url.endswith("/v5/market/time"):
+            # Keeps BybitServerTimeProvider in sync so the clock-drift gate
+            # doesn't itself block the order this test is trying to reach.
+            return {"result": {"timeSecond": str(int(datetime.now(timezone.utc).timestamp()))}}
+        return self._base.http_get(url, params)
+
+    def http_post(self, url: str, payload: dict) -> dict:
+        resp = self._base.http_post(url, payload)
+        # Auto-confirm any newly created order as Filled, at the price of
+        # the most recently served candle, so the wiring test doesn't need
+        # to predict order IDs to pre-queue a status.
+        order_id = resp.get("result", {}).get("orderId")
+        if url.endswith("/v5/order/create") and order_id:
+            last_close = self._rows[self._idx - 1][4] if self._idx > 0 else "100"
+            self._base.queue_status(order_id, [
+                {"orderStatus": "Filled", "cumExecQty": payload.get("qty", "0"),
+                 "avgPrice": last_close, "cumExecFee": "0.01"},
+            ])
+        return resp
+
+    def queue_status(self, order_id: str, rows: list[dict]) -> None:
+        self._base.queue_status(order_id, rows)
+
+
 def test_bybit_demo_pipeline_reaches_execution_engine_with_zero_network():
     """Drives the pipeline through Orchestrator.tick() end to end (market
     data -> strategy -> risk -> BybitDemoExecutionEngine.submit()) using only
-    the fake transport, proving the full BYBIT_DEMO wiring is reachable and
-    functional without a single real network call."""
+    the fake transport, with a candle sequence that deterministically
+    produces a BUY signal. Proves the full BYBIT_DEMO wiring actually
+    reaches execution -- not just that it's reachable in principle."""
     settings = make_bybit_demo_settings(
         risk_max_position_usd=50.0, risk_max_total_exposure_usd=50.0,
     )
-    transport = FakeBybitTransport()
-
-    def fake_kline_get(url, params):
-        if url.endswith("/v5/market/kline"):
-            return {
-                "result": {
-                    "list": [["1704067200000", "40000", "40100", "39950", "40050", "10", "0"]]
-                }
-            }
-        return transport.http_get(url, params)
+    base_transport = FakeBybitTransport()
+    rows = _generate_kline_rows(n_down=25, n_up=20)
+    transport = _KlineSequenceTransport(base_transport, rows)
 
     orch = build_orchestrator(settings, bybit_transport=transport)
-    orch.market_data_provider._http_get = fake_kline_get  # inject deterministic kline data
 
-    # Drives the full pipeline: market data -> strategy -> risk -> the real
-    # BybitDemoExecutionEngine object (reachable, even though this single
-    # candle isn't enough history to produce a BUY/SELL signal yet). No
-    # exception, and not a single call went over a real socket.
-    result = orch.tick()
-    assert result["status"] == "hold"
-    assert isinstance(orch.execution_engine, BybitDemoExecutionEngine)
+    results = []
+    for _ in range(len(rows) + 2):
+        result = orch.tick()
+        results.append(result)
+        if result["status"] == "order_filled":
+            break
+
+    assert results[-1]["status"] == "order_filled", f"never filled an order: {results}"
+    assert any(call[0].endswith("/v5/order/create") for call in base_transport.post_calls), (
+        "BybitDemoExecutionEngine.submit() never actually called order create"
+    )
+
+    order_id = results[-1]["order_id"]
+    with orch.session_factory() as session:
+        from app.persistence.models import Execution, Order, RiskEvaluation, StrategySignal
+
+        order = session.get(Order, order_id)
+        assert order is not None
+        assert order.status in ("FILLED", "PARTIALLY_FILLED")
+        assert order.exchange_order_id
+
+        risk_eval = session.get(RiskEvaluation, order.risk_evaluation_id)
+        assert risk_eval is not None
+        assert risk_eval.approved is True
+
+        signal = session.get(StrategySignal, risk_eval.signal_id)
+        assert signal is not None
+        assert signal.direction in ("BUY", "SELL")
+
+        executions = session.query(Execution).filter_by(order_id=order.id).all()
+        assert len(executions) >= 1
+        assert executions[0].fill_qty > 0
+
+    with session_scope(orch.session_factory) as session:
+        open_positions = repo.open_positions(session)
+        assert len(open_positions) == 1

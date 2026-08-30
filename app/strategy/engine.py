@@ -74,7 +74,7 @@ class StrategyEngine:
             self._prev_fast_above_slow = None if fast is None or slow is None else fast > slow
             return Signal(
                 symbol=self.symbol, direction="HOLD",
-                justification="Insufficient history to compute indicators yet.",
+                justification="Histórico insuficiente para calcular os indicadores ainda.",
                 created_at=utcnow(), observed_price=candle.close, atr=atr or 0.0,
                 stop_loss=None, take_profit=None, params=params,
             )
@@ -84,7 +84,10 @@ class StrategyEngine:
             self._prev_fast_above_slow = fast > slow
             return Signal(
                 symbol=self.symbol, direction="HOLD",
-                justification=f"ATR% {atr_pct:.5f} below min volatility filter {cfg.min_atr_pct_of_price}.",
+                justification=(
+                    f"ATR% {atr_pct:.5f} abaixo do filtro mínimo de volatilidade "
+                    f"({cfg.min_atr_pct_of_price}); mercado considerado parado demais."
+                ),
                 created_at=utcnow(), observed_price=candle.close, atr=atr,
                 stop_loss=None, take_profit=None, params=params,
             )
@@ -92,14 +95,17 @@ class StrategyEngine:
             self._prev_fast_above_slow = fast > slow
             return Signal(
                 symbol=self.symbol, direction="HOLD",
-                justification=f"ATR% {atr_pct:.5f} above max volatility filter {cfg.max_atr_pct_of_price}.",
+                justification=(
+                    f"ATR% {atr_pct:.5f} acima do filtro máximo de volatilidade "
+                    f"({cfg.max_atr_pct_of_price}); mercado considerado volátil demais."
+                ),
                 created_at=utcnow(), observed_price=candle.close, atr=atr,
                 stop_loss=None, take_profit=None, params=params,
             )
 
         fast_above_slow = fast > slow
         direction = "HOLD"
-        justification = f"No crossover: fast_sma={fast:.2f} slow_sma={slow:.2f}."
+        justification = f"Sem cruzamento: média rápida={fast:.2f} média lenta={slow:.2f}."
         stop_loss = None
         take_profit = None
 
@@ -107,18 +113,18 @@ class StrategyEngine:
             if fast_above_slow:
                 direction = "BUY"
                 justification = (
-                    f"Bullish crossover: fast_sma({cfg.fast_period})={fast:.2f} crossed above "
-                    f"slow_sma({cfg.slow_period})={slow:.2f}; trend filter and ATR volatility "
-                    f"filter (ATR%={atr_pct:.5f}) passed."
+                    f"Cruzamento de alta: média rápida({cfg.fast_period})={fast:.2f} cruzou "
+                    f"acima da média lenta({cfg.slow_period})={slow:.2f}; filtro de tendência e "
+                    f"filtro de volatilidade ATR (ATR%={atr_pct:.5f}) aprovados."
                 )
                 stop_loss = candle.close - cfg.stop_loss_atr_multiple * atr
                 take_profit = candle.close + cfg.take_profit_atr_multiple * atr
             else:
                 direction = "SELL"
                 justification = (
-                    f"Bearish crossover: fast_sma({cfg.fast_period})={fast:.2f} crossed below "
-                    f"slow_sma({cfg.slow_period})={slow:.2f}; trend filter and ATR volatility "
-                    f"filter (ATR%={atr_pct:.5f}) passed."
+                    f"Cruzamento de baixa: média rápida({cfg.fast_period})={fast:.2f} cruzou "
+                    f"abaixo da média lenta({cfg.slow_period})={slow:.2f}; filtro de tendência e "
+                    f"filtro de volatilidade ATR (ATR%={atr_pct:.5f}) aprovados."
                 )
                 stop_loss = candle.close + cfg.stop_loss_atr_multiple * atr
                 take_profit = candle.close - cfg.take_profit_atr_multiple * atr

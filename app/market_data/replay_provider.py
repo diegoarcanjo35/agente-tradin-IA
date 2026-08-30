@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.core.clock import utcnow
-from app.market_data.base import CandleTick
+from app.market_data.base import CandleFetchResult, CandleFetchStatus, CandleTick
 
 
 class ReplayMarketDataProvider:
@@ -36,15 +36,15 @@ class ReplayMarketDataProvider:
     def __len__(self) -> int:
         return len(self._candles)
 
-    def next_candle(self) -> CandleTick | None:
+    def next_candle(self) -> CandleFetchResult:
         if self._cursor >= len(self._candles):
-            return None
+            return CandleFetchResult(status=CandleFetchStatus.REPLAY_FINISHED)
         row = self._candles[self._cursor]
         self._cursor += 1
         open_time = datetime.fromisoformat(row["open_time"]).astimezone(timezone.utc)
         now = utcnow()
         self._last_received_at = now
-        return CandleTick(
+        candle = CandleTick(
             symbol=self.symbol,
             timeframe=self.timeframe,
             open_time=open_time,
@@ -56,6 +56,7 @@ class ReplayMarketDataProvider:
             source="replay",
             received_at=now,
         )
+        return CandleFetchResult(status=CandleFetchStatus.CANDLE_AVAILABLE, candle=candle)
 
     def is_stale(self, max_staleness_seconds: float) -> bool:
         # REPLAY data is synthetic and stamped "received" at read time, so by

@@ -13,20 +13,33 @@ from __future__ import annotations
 
 from pybit.unified_trading import HTTP
 
-from app.core.config import assert_demo_host
-from app.core.errors import ExchangeTimeoutError, RateLimitError
+from app.core.config import assert_consistent_bybit_environment
+from app.core.errors import ExchangeTimeoutError, ProductionEndpointBlockedError, RateLimitError
 
 _RATE_LIMIT_MARKERS = ("rate limit", "too many visits", "10006", "10018", "10016")
 _TIMEOUT_MARKERS = ("timed out", "timeout", "connection aborted", "read timed out")
 
+# Correction v1.2 #6: the pybit kwargs for each environment this phase
+# supports. Only "demo" is currently allowed by the config allowlist -- see
+# app/core/config.py::BYBIT_HOST_ENVIRONMENTS for the full rationale.
+_PYBIT_ENV_KWARGS = {
+    "demo": {"demo": True, "testnet": False},
+}
 
-def build_pybit_client(base_url: str, api_key: str, api_secret: str) -> HTTP:
-    """Validates the configured host is demo/testnet before constructing the
-    client. pybit's own `demo=True` flag routes requests to Bybit's Demo
-    Trading endpoints; we still re-validate `base_url` here so a misconfigured
-    non-demo host is caught before any client object exists."""
-    assert_demo_host(base_url)
-    return HTTP(demo=True, api_key=api_key, api_secret=api_secret)
+
+def build_pybit_client(base_url: str, ws_url: str, api_key: str, api_secret: str) -> HTTP:
+    """Derives the pybit client mode from the VALIDATED host environment,
+    instead of hardcoding demo=True regardless of what base_url actually
+    says. Cross-checks base_url and ws_url resolve to the same environment
+    before constructing anything."""
+    env = assert_consistent_bybit_environment(base_url, ws_url)
+    kwargs = _PYBIT_ENV_KWARGS.get(env)
+    if kwargs is None:
+        raise ProductionEndpointBlockedError(
+            f"Ambiente Bybit '{env}' não possui configuração de cliente pybit suportada "
+            "nesta fase. Inicialização recusada."
+        )
+    return HTTP(api_key=api_key, api_secret=api_secret, **kwargs)
 
 
 class PybitTransport:

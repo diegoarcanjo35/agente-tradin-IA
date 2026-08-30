@@ -13,7 +13,7 @@ from app.ai_shadow.agent import AIShadowAgent, SimulatedProvider
 from app.core.clock import ReplayClockProvider
 from app.core.config import RunMode, Settings
 from app.execution.paper_local import PaperLocalExecutionEngine
-from app.market_data.base import CandleTick
+from app.market_data.base import CandleFetchResult, CandleFetchStatus, CandleTick
 from app.orchestrator import Orchestrator
 from app.persistence import repo
 from app.persistence.db import session_scope
@@ -33,12 +33,12 @@ class ListMarketDataProvider:
         self._candles = candles
         self._cursor = 0
 
-    def next_candle(self) -> CandleTick | None:
+    def next_candle(self) -> CandleFetchResult:
         if self._cursor >= len(self._candles):
-            return None
+            return CandleFetchResult(status=CandleFetchStatus.REPLAY_FINISHED)
         c = self._candles[self._cursor]
         self._cursor += 1
-        return c
+        return CandleFetchResult(status=CandleFetchStatus.CANDLE_AVAILABLE, candle=c)
 
     def is_stale(self, max_staleness_seconds: float) -> bool:
         return False
@@ -117,14 +117,17 @@ def test_two_far_apart_candles_produce_two_different_correct_fill_prices(session
     engine = PaperLocalExecutionEngine(price_provider=lambda s: price_state.get(s, 0.0), slippage_bps=0.0)
 
     from app.execution.idempotency import make_idempotency_key
+    from tests.factories import approved_open_order
 
-    o1 = RiskEngine.make_test_approved_order(
-        signal_id=1, symbol="BTCUSDT", side="BUY", qty=0.01, stop_loss=None, take_profit=None,
+    o1 = approved_open_order(
+        symbol="BTCUSDT", side="BUY", qty=0.01, price=100.0,
+        stop_loss=None, take_profit=None, signal_id=1,
     )
     r1 = engine.submit(o1, make_idempotency_key(o1, "b1"), reference_price=100.0)
 
-    o2 = RiskEngine.make_test_approved_order(
-        signal_id=2, symbol="BTCUSDT", side="BUY", qty=0.01, stop_loss=None, take_profit=None,
+    o2 = approved_open_order(
+        symbol="BTCUSDT", side="BUY", qty=0.01, price=50000.0,
+        stop_loss=None, take_profit=None, signal_id=2,
     )
     r2 = engine.submit(o2, make_idempotency_key(o2, "b2"), reference_price=50000.0)
 

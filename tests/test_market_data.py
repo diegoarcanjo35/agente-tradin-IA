@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from app.core.errors import RateLimitError
+from app.market_data.base import CandleFetchStatus
 from app.market_data.bybit_provider import BybitDemoMarketDataProvider
 from app.market_data.replay_provider import ReplayMarketDataProvider
 
@@ -19,19 +20,23 @@ FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "replay_btcusdt.
 
 def test_replay_provider_yields_deterministic_candles():
     provider = ReplayMarketDataProvider(FIXTURE, symbol="BTCUSDT")
-    first = provider.next_candle()
-    assert first is not None
-    assert first.symbol == "BTCUSDT"
-    assert first.source == "replay"
+    result = provider.next_candle()
+    assert result.status == CandleFetchStatus.CANDLE_AVAILABLE
+    assert result.candle.symbol == "BTCUSDT"
+    assert result.candle.source == "replay"
 
 
-def test_replay_provider_exhausts_and_returns_none():
+def test_replay_provider_exhausts_and_reports_replay_finished():
     provider = ReplayMarketDataProvider(FIXTURE, symbol="BTCUSDT")
     count = 0
-    while provider.next_candle() is not None:
+    while True:
+        result = provider.next_candle()
+        if result.status == CandleFetchStatus.REPLAY_FINISHED:
+            break
+        assert result.status == CandleFetchStatus.CANDLE_AVAILABLE
         count += 1
     assert count == len(provider)
-    assert provider.next_candle() is None
+    assert provider.next_candle().status == CandleFetchStatus.REPLAY_FINISHED
 
 
 def test_replay_provider_module_has_no_network_imports():
@@ -59,7 +64,7 @@ def test_bybit_provider_is_stale_before_first_candle():
     assert provider.is_stale(max_staleness_seconds=30) is True
 
 
-def test_bybit_provider_backs_off_on_rate_limit_and_does_not_raise():
+def test_bybit_provider_backs_off_on_rate_limit_and_reports_retryable_error():
     calls = {"n": 0}
     sleeps = []
 
@@ -72,10 +77,21 @@ def test_bybit_provider_backs_off_on_rate_limit_and_does_not_raise():
         http_get=fake_get, sleep=lambda s: sleeps.append(s),
     )
     result = provider.next_candle()
-    assert result is None
+    assert result.status == CandleFetchStatus.RETRYABLE_ERROR
     assert calls["n"] == 1
     assert len(sleeps) == 1
     assert sleeps[0] > 0
+
+
+def test_bybit_provider_empty_response_reports_no_new_candle():
+    def fake_get(url, params):
+        return {"result": {"list": []}}
+
+    provider = BybitDemoMarketDataProvider(
+        "https://api-demo.bybit.com", "BTCUSDT", "1", http_get=fake_get, sleep=lambda s: None
+    )
+    result = provider.next_candle()
+    assert result.status == CandleFetchStatus.NO_NEW_CANDLE
 
 
 def test_bybit_provider_rejects_non_demo_host():

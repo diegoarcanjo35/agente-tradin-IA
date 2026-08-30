@@ -42,6 +42,13 @@ body {
 
 .topbar h1 { font-size: 18px; margin: 0; flex: 1 1 auto; min-width: 240px; }
 
+.status-message {
+  padding: 8px 20px;
+  font-size: 13px;
+  color: var(--amber);
+  min-height: 1.4em;
+}
+
 .status-chips { display: flex; flex-wrap: wrap; gap: 8px; }
 
 .chip {

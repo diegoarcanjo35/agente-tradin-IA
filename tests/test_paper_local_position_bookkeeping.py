@@ -8,13 +8,13 @@ import pytest
 
 from app.execution.idempotency import make_idempotency_key
 from app.execution.paper_local import PaperLocalExecutionEngine
-from app.risk.engine import RiskEngine
+from tests.factories import approved_open_order
 
 
 def order(side, qty, signal_id=1):
-    return RiskEngine.make_test_approved_order(
-        signal_id=signal_id, symbol="BTCUSDT", side=side, qty=qty,
-        stop_loss=None, take_profit=None,
+    return approved_open_order(
+        symbol="BTCUSDT", side=side, qty=qty, price=40000.0,
+        stop_loss=None, take_profit=None, signal_id=signal_id,
     )
 
 

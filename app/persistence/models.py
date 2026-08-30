@@ -14,6 +14,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -26,6 +27,9 @@ class Base(DeclarativeBase):
 
 class Candle(Base):
     __tablename__ = "candles"
+    __table_args__ = (
+        UniqueConstraint("symbol", "timeframe", "open_time", name="uq_candle_symbol_timeframe_open_time"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
@@ -179,4 +183,5 @@ class SystemState(Base):
     cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     api_failure_count: Mapped[int] = mapped_column(Integer, default=0)
     state_ambiguous: Mapped[bool] = mapped_column(Boolean, default=False)
+    clock_out_of_sync: Mapped[bool] = mapped_column(Boolean, default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

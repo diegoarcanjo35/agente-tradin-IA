@@ -4,6 +4,7 @@ dashboard + control API. Boots in REPLAY mode by default (no .env required).
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -95,7 +96,8 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator:
             transport = bybit_transport
         else:
             pybit_client = build_pybit_client(
-                settings.bybit_base_url, settings.bybit_api_key, settings.bybit_api_secret
+                settings.bybit_base_url, settings.bybit_ws_url,
+                settings.bybit_api_key, settings.bybit_api_secret,
             )
             transport = PybitTransport(pybit_client)
 
@@ -138,12 +140,48 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator:
     return orchestrator
 
 
+async def _poll_loop(app: FastAPI) -> None:
+    """Correction v1.2 #1: only CandleFetchStatus.REPLAY_FINISHED (surfaced
+    by Orchestrator.tick() as status "no_data") may end this loop. Every
+    other outcome -- no new candle yet, a retryable error, a fatal error --
+    keeps polling; retryable/fatal errors just feed TRADING_BLOCKED via the
+    orchestrator instead of silently killing the background task."""
+    orch = app.state.orchestrator
+    settings = app.state.settings
+    interval = (
+        settings.bybit_poll_interval_seconds
+        if settings.mode == RunMode.BYBIT_DEMO
+        else settings.replay_poll_interval_seconds
+    )
+    while True:
+        result = orch.tick()
+        status = result.get("status")
+        if status == "no_data":
+            app.state.replay_done = True
+            log_event(logger, 20, "replay_complete")
+            return
+        if status == "retryable_error":
+            log_event(logger, 30, "market_data_retryable_error", detail=result.get("detail"))
+        elif status == "fatal_error":
+            log_event(logger, 40, "market_data_fatal_error", detail=result.get("detail"))
+        await asyncio.sleep(interval)
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    app.state.loop_task = asyncio.create_task(_poll_loop(app))
+    try:
+        yield
+    finally:
+        app.state.loop_task.cancel()
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     setup_logging(settings.log_dir, settings.log_level, settings.log_max_bytes, settings.log_backup_count)
     log_event(logger, 20, "app_starting", mode=settings.mode.value)
 
-    app = FastAPI(title="Agente Trader Demo", version="0.1.0")
+    app = FastAPI(title="Agente Trader Demo", version="0.1.0", lifespan=_lifespan)
     app.state.settings = settings
     app.state.orchestrator = build_orchestrator(settings)
     app.state.replay_done = False
@@ -157,20 +195,6 @@ def create_app() -> FastAPI:
         return FileResponse(FRONTEND_DIR / "index.html")
 
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
-
-    @app.on_event("startup")
-    async def _start_loop():
-        async def loop():
-            orch = app.state.orchestrator
-            while True:
-                result = orch.tick()
-                if result.get("status") == "no_data":
-                    app.state.replay_done = True
-                    log_event(logger, 20, "replay_complete")
-                    return
-                await asyncio.sleep(0.02)
-
-        app.state.loop_task = asyncio.create_task(loop())
 
     return app
 

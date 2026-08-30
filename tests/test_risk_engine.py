@@ -142,12 +142,12 @@ def test_execution_requires_risk_approval():
     with pytest.raises(TypeError):
         RiskEngine.attempt_construct_with_invalid_token_for_testing(object())
 
-    # A genuine token still works (this is how RiskEngine.evaluate() builds one).
-    order = RiskEngine.make_test_approved_order(
-        signal_id=1, symbol="BTCUSDT", side="BUY", qty=0.001,
-        stop_loss=39000.0, take_profit=41000.0,
-    )
-    assert order.side == "BUY"
+    # A genuine approval only ever comes from actually calling evaluate().
+    engine = RiskEngine(RiskLimits(max_position_usd=50.0, max_total_exposure_usd=50.0))
+    result = engine.evaluate(make_signal(), signal_id=1, context=base_context())
+    assert result.approved
+    assert result.approved_order is not None
+    assert result.approved_order.side == "BUY"
 
 
 # --- evaluate_close() -------------------------------------------------

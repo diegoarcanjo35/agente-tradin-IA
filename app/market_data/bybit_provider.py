@@ -7,14 +7,14 @@ can never be pointed at production even if misused directly.
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from app.core.clock import utcnow
 from app.core.config import assert_demo_host
 from app.core.errors import ExchangeTimeoutError, RateLimitError
 from app.core.logging import get_logger, log_event
-from app.market_data.base import CandleTick
+from app.market_data.base import CandleFetchResult, CandleFetchStatus, CandleTick
 
 logger = get_logger(__name__)
 
@@ -35,11 +35,30 @@ class BackoffPolicy:
         return delay
 
 
+def parse_bybit_interval_to_timedelta(interval: str) -> timedelta:
+    """Bybit V5 kline `interval`: a number of minutes ("1", "3", "5", ...),
+    or "D"/"W"/"M" for day/week/month. This project only ever uses minute
+    intervals, so month is intentionally unsupported (ambiguous duration)."""
+    if interval.isdigit():
+        return timedelta(minutes=int(interval))
+    mapping = {"D": timedelta(days=1), "W": timedelta(weeks=1)}
+    if interval in mapping:
+        return mapping[interval]
+    raise ValueError(f"Unsupported Bybit kline interval: {interval!r}")
+
+
 class BybitDemoMarketDataProvider:
     """Thin wrapper the orchestrator drives on a poll loop. `http_get` is
     injected so tests can substitute a fake transport with no network access
     (see tests/fakes/bybit_fake.py); production wiring passes a real client
     built from pybit against the validated demo base_url.
+
+    Correction v1.2 #1/#2: next_candle() never returns a bare None. It
+    reports one of CandleFetchStatus so the caller can tell "nothing new
+    yet" and "the exchange is unreachable right now" apart from "REPLAY is
+    over" -- only the latter may end the orchestrator's polling loop. It
+    also never hands back a candle that (a) is the same one already
+    returned, or (b) is still forming (its period hasn't fully elapsed yet).
     """
 
     def __init__(
@@ -49,6 +68,7 @@ class BybitDemoMarketDataProvider:
         timeframe: str,
         http_get: Callable[[str, dict], dict],
         sleep: Callable[[float], None] = time.sleep,
+        now_fn: Callable[[], datetime] = utcnow,
     ):
         assert_demo_host(base_url)
         self.base_url = base_url
@@ -56,11 +76,14 @@ class BybitDemoMarketDataProvider:
         self.timeframe = timeframe
         self._http_get = http_get
         self._sleep = sleep
+        self._now_fn = now_fn
+        self._interval_duration = parse_bybit_interval_to_timedelta(timeframe)
         self._backoff = BackoffPolicy()
         self._last_received_at: datetime | None = None
+        self._last_processed_open_time: datetime | None = None
         self._consecutive_failures = 0
 
-    def next_candle(self) -> CandleTick | None:
+    def next_candle(self) -> CandleFetchResult:
         try:
             resp = self._http_get(
                 f"{self.base_url}/v5/market/kline",
@@ -74,17 +97,31 @@ class BybitDemoMarketDataProvider:
             log_event(logger, 30, "market_data_fetch_failed", error=str(exc), retry_in=delay,
                       consecutive_failures=self._consecutive_failures)
             self._sleep(delay)
-            return None
+            return CandleFetchResult(
+                status=CandleFetchStatus.RETRYABLE_ERROR,
+                detail=f"Falha temporária ao consultar dados de mercado da Bybit: {exc}",
+            )
 
         rows = resp.get("result", {}).get("list", [])
         if not rows:
-            return None
+            return CandleFetchResult(status=CandleFetchStatus.NO_NEW_CANDLE)
+
         # Bybit kline rows: [start, open, high, low, close, volume, turnover]
         row = rows[0]
+        open_time = datetime.fromtimestamp(int(row[0]) / 1000, tz=timezone.utc)
+
+        if self._last_processed_open_time is not None and open_time <= self._last_processed_open_time:
+            return CandleFetchResult(status=CandleFetchStatus.NO_NEW_CANDLE)
+
+        close_time = open_time + self._interval_duration
+        if self._now_fn() < close_time:
+            # Still forming -- never make a decision on an open candle.
+            return CandleFetchResult(status=CandleFetchStatus.NO_NEW_CANDLE)
+
         now = utcnow()
         self._last_received_at = now
-        open_time = datetime.fromtimestamp(int(row[0]) / 1000, tz=timezone.utc)
-        return CandleTick(
+        self._last_processed_open_time = open_time
+        candle = CandleTick(
             symbol=self.symbol,
             timeframe=self.timeframe,
             open_time=open_time,
@@ -96,6 +133,7 @@ class BybitDemoMarketDataProvider:
             source="bybit_demo",
             received_at=now,
         )
+        return CandleFetchResult(status=CandleFetchStatus.CANDLE_AVAILABLE, candle=candle)
 
     def is_stale(self, max_staleness_seconds: float) -> bool:
         if self._last_received_at is None:

@@ -10,9 +10,18 @@ Execution Engine's public API only accepts an `ApprovedOrder`, and
 sentinel that is private to this module. `_RiskApprovalToken` must never be
 imported or instantiated outside app/risk/engine.py -- see
 tests/test_risk_engine_boundary.py, which fails the build if any other file
-does so. Tests that need an ApprovedOrder must use
-`RiskEngine.make_test_approved_order(...)` below, a controlled, clearly
-test-only factory that still only exists inside this module.
+does so.
+
+Correction v1.2 #4: there is deliberately NO factory in production code that
+mints a valid `ApprovedOrder` outside of `evaluate()`/`evaluate_close()` --
+an earlier `make_test_approved_order()` helper was removed because, despite
+being documented as "test-only", it was still importable and callable by any
+code running in the same process, undermining the very guarantee this module
+exists to provide. Tests obtain a real `ApprovedOrder` by actually calling
+`evaluate()`/`evaluate_close()` with a valid signal/context -- see
+tests/factories.py. The only test-support helper that remains here is
+`attempt_construct_with_invalid_token_for_testing()`, which can never
+succeed in producing a usable order (it always raises `TypeError`).
 """
 from __future__ import annotations
 
@@ -83,32 +92,32 @@ class RiskEngine:
 
         checks["kill_switch_engaged"] = not context.kill_switch_engaged
         if context.kill_switch_engaged:
-            return "Kill switch is engaged; all trading blocked."
+            return "Bloqueio de emergência ativado; todas as operações estão bloqueadas."
 
         checks["trading_blocked"] = not context.trading_blocked
         if context.trading_blocked:
-            return "System state is TRADING_BLOCKED."
+            return "Sistema em estado de operações bloqueadas (TRADING_BLOCKED)."
 
         checks["state_not_ambiguous"] = not context.state_ambiguous
         if context.state_ambiguous:
-            return "Local state is ambiguous relative to the exchange; reconciliation required."
+            return "Estado local ambíguo em relação à corretora; reconciliação necessária."
 
         checks["data_fresh"] = not context.data_is_stale
         if context.data_is_stale:
-            return "Market data is stale; refusing to trade on stale data."
+            return "Dados de mercado desatualizados; operação recusada com dados obsoletos."
 
         drift = context.clock_drift_seconds
         checks["clock_synced"] = drift is not None and abs(drift) <= limits.max_clock_drift_seconds
         if not checks["clock_synced"]:
             if drift is None:
-                return "Clock drift could not be determined; refusing to trade."
-            return f"Clock drift {drift:.2f}s exceeds {limits.max_clock_drift_seconds}s."
+                return "Não foi possível determinar o drift do relógio; operação recusada."
+            return f"Drift do relógio de {drift:.2f}s excede o limite de {limits.max_clock_drift_seconds}s."
 
         checks["api_failures_ok"] = context.api_failure_count < limits.max_api_failures
         if not checks["api_failures_ok"]:
             return (
-                f"API failure count {context.api_failure_count} reached limit "
-                f"{limits.max_api_failures}."
+                f"Contagem de falhas de API ({context.api_failure_count}) atingiu o limite "
+                f"de {limits.max_api_failures}."
             )
 
         return None
@@ -131,24 +140,24 @@ class RiskEngine:
         if not checks["cooldown_expired"]:
             return reject(
                 "cooldown_expired",
-                f"Cooldown active after {context.consecutive_losses} consecutive losses "
-                f"until {context.cooldown_until.isoformat()}.",
+                f"Cooldown ativo após {context.consecutive_losses} perdas consecutivas "
+                f"até {context.cooldown_until.isoformat()}.",
             )
 
         checks["actionable_signal"] = signal.direction in ("BUY", "SELL")
         if not checks["actionable_signal"]:
-            return reject("actionable_signal", "Signal direction is HOLD; nothing to evaluate.")
+            return reject("actionable_signal", "Direção do sinal é AGUARDAR (HOLD); nada a avaliar.")
 
         checks["stop_loss_present"] = (not limits.require_stop_loss) or signal.stop_loss is not None
         if not checks["stop_loss_present"]:
-            return reject("stop_loss_present", "Order rejected: no stop-loss on signal.")
+            return reject("stop_loss_present", "Ordem rejeitada: sinal sem stop-loss.")
 
         checks["daily_loss_within_limit"] = context.daily_realized_loss_usd < limits.max_daily_loss_usd
         if not checks["daily_loss_within_limit"]:
             return reject(
                 "daily_loss_within_limit",
-                f"Daily realized loss {context.daily_realized_loss_usd:.2f} USD reached limit "
-                f"{limits.max_daily_loss_usd} USD.",
+                f"Perda diária realizada de USD {context.daily_realized_loss_usd:.2f} atingiu "
+                f"o limite de USD {limits.max_daily_loss_usd}.",
             )
 
         checks["concurrent_positions_ok"] = (
@@ -157,7 +166,7 @@ class RiskEngine:
         if not checks["concurrent_positions_ok"]:
             return reject(
                 "concurrent_positions_ok",
-                f"Open positions {context.open_positions_count} reached limit "
+                f"Posições abertas ({context.open_positions_count}) atingiram o limite de "
                 f"{limits.max_concurrent_positions}.",
             )
 
@@ -166,14 +175,14 @@ class RiskEngine:
         if not checks["exposure_room_available"]:
             return reject(
                 "exposure_room_available",
-                f"Open exposure {context.open_exposure_usd:.2f} USD already at/over limit "
-                f"{limits.max_total_exposure_usd} USD.",
+                f"Exposição aberta (USD {context.open_exposure_usd:.2f}) já está no limite ou "
+                f"acima dele (USD {limits.max_total_exposure_usd}).",
             )
 
         position_usd = min(limits.max_position_usd, remaining_exposure)
         checks["position_size_positive"] = position_usd > 0
         if not checks["position_size_positive"]:
-            return reject("position_size_positive", "Computed position size is not positive.")
+            return reject("position_size_positive", "Tamanho de posição calculado não é positivo.")
 
         qty = position_usd / signal.observed_price
         approved_order = ApprovedOrder(
@@ -188,7 +197,7 @@ class RiskEngine:
         )
         return RiskEvaluationResult(
             approved=True,
-            reason=f"Approved: position_usd={position_usd:.2f}, qty={qty:.8f}.",
+            reason=f"Aprovado: valor_posicao_usd={position_usd:.2f}, quantidade={qty:.8f}.",
             checks=checks,
             approved_order=approved_order,
         )
@@ -224,25 +233,25 @@ class RiskEngine:
 
         checks["position_exists"] = position_exists
         if not position_exists:
-            return reject("position_exists", "No open position to close for this symbol.")
+            return reject("position_exists", "Não há posição aberta para fechar neste símbolo.")
 
         checks["close_side_valid"] = close_side in ("BUY", "SELL") and close_side != position_side
         if not checks["close_side_valid"]:
             return reject(
                 "close_side_valid",
-                f"Close side {close_side!r} must be BUY/SELL and opposite of position side "
-                f"{position_side!r}.",
+                f"Lado de fechamento {close_side!r} deve ser COMPRA/VENDA e oposto ao lado da "
+                f"posição {position_side!r}.",
             )
 
         checks["qty_positive"] = qty > 0
         if not checks["qty_positive"]:
-            return reject("qty_positive", "Close quantity must be positive.")
+            return reject("qty_positive", "Quantidade de fechamento deve ser positiva.")
 
         checks["qty_within_position"] = qty <= position_qty + 1e-12
         if not checks["qty_within_position"]:
             return reject(
                 "qty_within_position",
-                f"Close quantity {qty} exceeds open position quantity {position_qty}.",
+                f"Quantidade de fechamento {qty} excede a quantidade da posição aberta {position_qty}.",
             )
 
         approved_order = ApprovedOrder(
@@ -257,7 +266,7 @@ class RiskEngine:
         )
         return RiskEvaluationResult(
             approved=True,
-            reason=f"Close approved: qty={qty:.8f} side={close_side}.",
+            reason=f"Fechamento aprovado: quantidade={qty:.8f} lado={close_side}.",
             checks=checks,
             approved_order=approved_order,
         )
@@ -273,21 +282,3 @@ class RiskEngine:
             stop_loss=None, take_profit=None, token=bad_token,  # type: ignore[arg-type]
         )
 
-    @staticmethod
-    def make_test_approved_order(
-        signal_id: int,
-        symbol: str,
-        side: str,
-        qty: float,
-        stop_loss: float | None = None,
-        take_profit: float | None = None,
-        is_close: bool = False,
-    ) -> ApprovedOrder:
-        """Test-only factory. Production code must always go through
-        evaluate() or evaluate_close() -- this exists so tests never need to
-        import or instantiate the private _RiskApprovalToken themselves."""
-        return ApprovedOrder(
-            signal_id=signal_id, symbol=symbol, side=side, qty=qty,
-            stop_loss=stop_loss, take_profit=take_profit,
-            token=_RiskApprovalToken(), is_close=is_close,
-        )

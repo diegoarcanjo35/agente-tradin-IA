@@ -1,9 +1,25 @@
+// Correction v1.2 #7: NEVER use innerHTML with data that came from the
+// backend (justificativas, motivos, resumos de IA, mensagens de erro) --
+// all of it is inserted via textContent / DOM element creation only, so an
+// externally-supplied string (e.g. from a future real AI provider) can
+// never be interpreted as markup or an executable event handler.
 const $ = (id) => document.getElementById(id);
 
-function fmt(v, digits = 2) {
-  if (v === "indisponível" || v === null || v === undefined) return '<span class="unavailable">indisponível</span>';
+const DIRECTION_LABELS = { BUY: "COMPRA", SELL: "VENDA", HOLD: "AGUARDAR" };
+const MODE_LABELS = { REPLAY: "REPLAY (simulado)", PAPER_LOCAL: "PAPER_LOCAL (simulado)", BYBIT_DEMO: "BYBIT_DEMO (Bybit Demo Trading)" };
+
+function translateDirection(direction) {
+  return DIRECTION_LABELS[direction] || direction;
+}
+
+function fmtNumber(v, digits = 2) {
+  if (v === "indisponível" || v === null || v === undefined) return "indisponível";
   if (typeof v === "number") return v.toFixed(digits);
   return String(v);
+}
+
+function isUnavailable(v) {
+  return v === "indisponível" || v === null || v === undefined;
 }
 
 function pnlClass(v) {
@@ -16,89 +32,152 @@ async function getJSON(url, opts) {
   return res.json();
 }
 
+function clearChildren(node) {
+  while (node.firstChild) node.removeChild(node.firstChild);
+}
+
+// Builds one <div class="kv"><span>label</span><span class="v ...">value</span></div>
+// entirely via textContent -- no markup ever passes through as HTML.
+function kvRow(container, label, value, extraClass) {
+  const row = document.createElement("div");
+  row.className = "kv";
+
+  const labelSpan = document.createElement("span");
+  labelSpan.textContent = label;
+
+  const valueSpan = document.createElement("span");
+  valueSpan.className = "v" + (extraClass ? ` ${extraClass}` : "") + (isUnavailable(value) ? " unavailable" : "");
+  valueSpan.textContent = value;
+
+  row.appendChild(labelSpan);
+  row.appendChild(valueSpan);
+  container.appendChild(row);
+}
+
+// Builds a <tr> from an array of cell descriptors: string | {text, className}.
+function buildRow(cells) {
+  const tr = document.createElement("tr");
+  cells.forEach((cell) => {
+    const td = document.createElement("td");
+    if (cell && typeof cell === "object") {
+      td.textContent = cell.text;
+      if (cell.className) td.className = cell.className;
+    } else {
+      td.textContent = cell;
+    }
+    tr.appendChild(td);
+  });
+  return tr;
+}
+
+function setRows(tbody, rowsData) {
+  clearChildren(tbody);
+  rowsData.forEach((cells) => tbody.appendChild(buildRow(cells)));
+}
+
 async function refreshState() {
   const s = await getJSON("/api/state");
-  $("chip-mode").textContent = `MODO: ${s.mode}`;
+  $("chip-mode").textContent = `MODO: ${MODE_LABELS[s.mode] || s.mode}`;
   $("chip-conn").textContent = `CONEXÃO: ${s.mode === "REPLAY" ? "offline (replay)" : "ativa"}`;
-  $("chip-trading").textContent = `TRADING: ${s.trading_blocked ? "BLOQUEADO" : "ATIVO"}`;
-  $("chip-kill").textContent = `KILL SWITCH: ${s.kill_switch_engaged ? "ENGATADO" : "livre"}`;
-  $("last-updated").textContent = new Date().toISOString();
+  $("chip-trading").textContent = `OPERAÇÕES: ${s.trading_blocked ? "BLOQUEADAS" : "ATIVAS"}`;
+  $("chip-kill").textContent = `BLOQUEIO DE EMERGÊNCIA: ${s.kill_switch_engaged ? "ATIVADO" : "desativado"}`;
+  $("last-updated").textContent = new Date().toLocaleString("pt-BR");
 }
 
 async function refreshMetrics() {
   const m = await getJSON("/api/metrics");
-  $("metrics-box").innerHTML = `
-    <div class="kv"><span>Operações encerradas</span><span class="v">${m.closed_trades_count}</span></div>
-    <div class="kv"><span>Taxa de acerto</span><span class="v">${fmt(m.win_rate, 3)}</span></div>
-    <div class="kv"><span>Payoff</span><span class="v">${fmt(m.payoff)}</span></div>
-    <div class="kv"><span>Expectativa</span><span class="v">${fmt(m.expectancy)}</span></div>
-  `;
-  $("pnl-box").innerHTML = `
-    <div class="kv"><span>Lucro bruto</span><span class="v ${pnlClass(m.gross_profit)}">${fmt(m.gross_profit)}</span></div>
-    <div class="kv"><span>Prejuízo bruto</span><span class="v ${pnlClass(m.gross_loss)}">${fmt(m.gross_loss)}</span></div>
-    <div class="kv"><span>Lucro líquido</span><span class="v ${pnlClass(m.net_profit)}">${fmt(m.net_profit)}</span></div>
-    <div class="kv"><span>Comissões</span><span class="v">${fmt(m.commissions)}</span></div>
-    <div class="kv"><span>Funding</span><span class="v">${fmt(m.funding)}</span></div>
-  `;
-  $("risk-metrics-box").innerHTML = `
-    <div class="kv"><span>Profit factor</span><span class="v">${fmt(m.profit_factor)}</span></div>
-    <div class="kv"><span>Drawdown máx ($)</span><span class="v">${fmt(m.max_drawdown_money)}</span></div>
-    <div class="kv"><span>Drawdown máx (%)</span><span class="v">${fmt(m.max_drawdown_pct)}</span></div>
-    <div class="kv"><span>Retorno/Drawdown</span><span class="v">${fmt(m.return_over_drawdown)}</span></div>
-    <div class="kv"><span>Exposição (USD)</span><span class="v">${fmt(m.exposure_usd)}</span></div>
-  `;
+
+  const metricsBox = $("metrics-box");
+  clearChildren(metricsBox);
+  kvRow(metricsBox, "Operações encerradas", m.closed_trades_count);
+  kvRow(metricsBox, "Taxa de acerto", fmtNumber(m.win_rate, 3));
+  kvRow(metricsBox, "Payoff", fmtNumber(m.payoff));
+  kvRow(metricsBox, "Expectativa", fmtNumber(m.expectancy));
+
+  const pnlBox = $("pnl-box");
+  clearChildren(pnlBox);
+  kvRow(pnlBox, "Lucro bruto", fmtNumber(m.gross_profit), pnlClass(m.gross_profit));
+  kvRow(pnlBox, "Prejuízo bruto", fmtNumber(m.gross_loss), pnlClass(m.gross_loss));
+  kvRow(pnlBox, "Lucro líquido", fmtNumber(m.net_profit), pnlClass(m.net_profit));
+  kvRow(pnlBox, "Comissões", fmtNumber(m.commissions));
+  kvRow(pnlBox, "Taxa de financiamento (Funding)", fmtNumber(m.funding));
+
+  const riskBox = $("risk-metrics-box");
+  clearChildren(riskBox);
+  kvRow(riskBox, "Fator de lucro (Profit Factor)", fmtNumber(m.profit_factor));
+  kvRow(riskBox, "Rebaixamento máx. ($) (Drawdown)", fmtNumber(m.max_drawdown_money));
+  kvRow(riskBox, "Rebaixamento máx. (%) (Drawdown)", fmtNumber(m.max_drawdown_pct));
+  kvRow(riskBox, "Retorno/Rebaixamento", fmtNumber(m.return_over_drawdown));
+  kvRow(riskBox, "Exposição (USD)", fmtNumber(m.exposure_usd));
 }
 
 async function refreshAccount() {
   const positions = await getJSON("/api/positions");
   const totalExposure = positions.reduce((acc, p) => acc + p.qty * p.avg_entry_price, 0);
-  $("account-box").innerHTML = `
-    <div class="kv"><span>Saldo inicial (demo)</span><span class="v">1000.00</span></div>
-    <div class="kv"><span>Posições abertas</span><span class="v">${positions.length}</span></div>
-    <div class="kv"><span>Exposição aberta</span><span class="v">${totalExposure.toFixed(2)}</span></div>
-  `;
 
-  const tbody = document.querySelector("#positions-table tbody");
-  tbody.innerHTML = positions.map(p => `
-    <tr><td>${p.symbol}</td><td>${p.side}</td><td>${p.qty.toFixed(6)}</td>
-    <td>${p.avg_entry_price.toFixed(2)}</td><td>${p.stop_loss?.toFixed(2) ?? "-"}</td>
-    <td>${p.take_profit?.toFixed(2) ?? "-"}</td></tr>
-  `).join("");
+  const accountBox = $("account-box");
+  clearChildren(accountBox);
+  kvRow(accountBox, "Saldo inicial (demo)", "1000.00");
+  kvRow(accountBox, "Posições abertas", positions.length);
+  kvRow(accountBox, "Exposição aberta", totalExposure.toFixed(2));
+
+  setRows(
+    document.querySelector("#positions-table tbody"),
+    positions.map((p) => [
+      p.symbol,
+      translateDirection(p.side),
+      p.qty.toFixed(6),
+      p.avg_entry_price.toFixed(2),
+      p.stop_loss != null ? p.stop_loss.toFixed(2) : "-",
+      p.take_profit != null ? p.take_profit.toFixed(2) : "-",
+    ])
+  );
 }
 
 async function refreshSignals() {
   const rows = await getJSON("/api/signals?limit=20");
-  const tbody = document.querySelector("#signals-table tbody");
-  tbody.innerHTML = rows.map(r => `
-    <tr><td>${r.created_at}</td><td>${r.direction}</td><td>${r.observed_price.toFixed(2)}</td>
-    <td>${r.justification}</td></tr>
-  `).join("");
+  setRows(
+    document.querySelector("#signals-table tbody"),
+    rows.map((r) => [
+      new Date(r.created_at).toLocaleString("pt-BR"),
+      translateDirection(r.direction),
+      r.observed_price.toFixed(2),
+      r.justification,
+    ])
+  );
 }
 
 async function refreshRisk() {
   const rows = await getJSON("/api/risk-evaluations?limit=20");
-  const tbody = document.querySelector("#risk-table tbody");
-  tbody.innerHTML = rows.map(r => `
-    <tr><td>${r.created_at}</td><td class="${r.approved ? 'positive' : 'negative'}">${r.approved}</td>
-    <td>${r.reason}</td></tr>
-  `).join("");
+  setRows(
+    document.querySelector("#risk-table tbody"),
+    rows.map((r) => [
+      new Date(r.created_at).toLocaleString("pt-BR"),
+      { text: r.approved ? "APROVADO" : "REJEITADO", className: r.approved ? "positive" : "negative" },
+      r.reason,
+    ])
+  );
 }
 
 async function refreshAI() {
   const rows = await getJSON("/api/ai-recommendations?limit=20");
-  const tbody = document.querySelector("#ai-table tbody");
-  tbody.innerHTML = rows.map(r => `
-    <tr><td>${r.created_at}</td><td>${r.recommendation}</td>
-    <td>${r.confidence.toFixed(2)}</td><td>${r.reasoning_summary}</td></tr>
-  `).join("");
+  setRows(
+    document.querySelector("#ai-table tbody"),
+    rows.map((r) => [
+      new Date(r.created_at).toLocaleString("pt-BR"),
+      translateDirection(r.recommendation),
+      r.confidence.toFixed(2),
+      r.reasoning_summary,
+    ])
+  );
 }
 
 async function refreshFailures() {
   const rows = await getJSON("/api/failures?limit=20");
-  const tbody = document.querySelector("#failures-table tbody");
-  tbody.innerHTML = rows.map(r => `
-    <tr><td>${r.created_at}</td><td>${r.kind}</td><td>${r.detail}</td></tr>
-  `).join("");
+  setRows(
+    document.querySelector("#failures-table tbody"),
+    rows.map((r) => [new Date(r.created_at).toLocaleString("pt-BR"), r.kind, r.detail])
+  );
 }
 
 async function refreshEquityCurve() {
@@ -112,7 +191,7 @@ async function refreshEquityCurve() {
     ctx.fillText("Sem operações encerradas ainda.", 10, h / 2);
     return;
   }
-  const values = points.map(p => p.equity);
+  const values = points.map((p) => p.equity);
   const min = Math.min(...values), max = Math.max(...values);
   const pad = 10;
   const scaleX = (w - 2 * pad) / (points.length - 1);
@@ -137,11 +216,13 @@ async function refreshAll() {
 }
 
 $("btn-kill").addEventListener("click", async () => {
-  await fetch("/api/kill-switch/engage", { method: "POST" });
+  const res = await getJSON("/api/kill-switch/engage", { method: "POST" });
+  if (res.mensagem) $("status-message").textContent = res.mensagem;
   refreshAll();
 });
 $("btn-unkill").addEventListener("click", async () => {
-  await fetch("/api/kill-switch/disengage", { method: "POST" });
+  const res = await getJSON("/api/kill-switch/disengage", { method: "POST" });
+  if (res.mensagem) $("status-message").textContent = res.mensagem;
   refreshAll();
 });
 

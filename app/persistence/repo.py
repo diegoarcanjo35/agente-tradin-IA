@@ -8,6 +8,7 @@ import json
 from datetime import datetime, timezone
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.clock import utcnow
@@ -35,6 +36,28 @@ def get_or_create_system_state(session: Session) -> SystemState:
     return state
 
 
+def recompute_trading_blocked(state: SystemState, max_api_failures: int) -> None:
+    """Correction v1.2 #5: TRADING_BLOCKED is derived from the individual
+    block sources (kill switch, ambiguous/divergent reconciliation state,
+    clock out of sync, API failure count over the limit), never a single
+    flag any one of them can clobber. `block_reason` lists every active
+    reason in Portuguese so disengaging the kill switch can never silently
+    clear a block caused by something else."""
+    reasons: list[str] = []
+    if state.kill_switch_engaged:
+        reasons.append("bloqueio de emergência ativado manualmente")
+    if state.state_ambiguous:
+        reasons.append("reconciliação divergente ou estado ambíguo em relação à corretora")
+    if state.clock_out_of_sync:
+        reasons.append("relógio local fora de sincronia com a referência")
+    if state.api_failure_count >= max_api_failures:
+        reasons.append(
+            f"limite de falhas consecutivas de API atingido ({state.api_failure_count}/{max_api_failures})"
+        )
+    state.trading_blocked = bool(reasons)
+    state.block_reason = "; ".join(reasons) if reasons else None
+
+
 def record_security_event(session: Session, event_type: str, detail: str) -> SecurityEvent:
     ev = SecurityEvent(event_type=event_type, detail=detail)
     session.add(ev)
@@ -51,13 +74,22 @@ def record_failure(session: Session, kind: str, detail: str, resolved: bool = Fa
 
 def save_candle(session: Session, symbol: str, timeframe: str, open_time: datetime,
                  open_: float, high: float, low: float, close: float, volume: float,
-                 source: str) -> Candle:
+                 source: str) -> Candle | None:
+    """Returns None (never raises) if this exact symbol+timeframe+open_time
+    was already persisted -- the unique constraint on `candles` is the last
+    line of defense against duplicate processing (correction v1.2 #2),
+    enforced via a SAVEPOINT so a concurrent duplicate never poisons the
+    whole session/transaction."""
     c = Candle(
         symbol=symbol, timeframe=timeframe, open_time=open_time,
         open=open_, high=high, low=low, close=close, volume=volume, source=source,
     )
-    session.add(c)
-    session.flush()
+    try:
+        with session.begin_nested():
+            session.add(c)
+            session.flush()
+    except IntegrityError:
+        return None
     return c
 
 

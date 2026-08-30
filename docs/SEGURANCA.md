@@ -1,5 +1,15 @@
 # Segurança
 
+## Idioma da experiência do usuário (correção v1.2)
+
+Toda a experiência destinada ao usuário — interface, botões, chips de
+estado, justificativas exibidas, mensagens de erro, confirmações — é em
+português do Brasil. Termos técnicos consolidados aparecem acompanhados da
+tradução, por exemplo `Fator de lucro (Profit Factor)`. Identificadores
+internos de código (nomes de classes, eventos como `KILL_SWITCH_ENGAGED`,
+endpoints) permanecem em inglês, por não serem lidos diretamente pelo
+usuário como frase. Verificado por `tests/test_frontend_i18n.py`.
+
 ## Proibição de dinheiro real
 
 - `app/core/config.py` mantém um allowlist explícito de hosts Bybit
@@ -112,3 +122,17 @@
   recusa iniciar (`UnsafeBindHostError`). Ver
   `tests/test_security.py::test_default_settings_bind_host_is_local`. Uma
   implementação completa de autenticação fica para uma fase futura.
+
+## Proteção contra injeção de HTML no painel (correção v1.2 #7)
+
+- `frontend/app.js` nunca usa `innerHTML` para inserir dado vindo do
+  backend (justificativa da estratégia, motivo do Risk Engine, resumo da
+  IA, detalhe de erro). Toda inserção de texto passa por `textContent` ou
+  criação segura de elementos DOM (`buildRow`/`kvRow`), então uma string
+  contendo marcação (ex.: `<img src=x onerror="...">`) é sempre exibida
+  como texto literal, nunca interpretada como HTML executável.
+- Prova estática: `tests/test_frontend_xss_safety.py::test_app_js_never_uses_innerhtml`.
+- Prova dinâmica: o mesmo arquivo de teste executa as funções reais de
+  construção de linha (`buildRow`/`kvRow`) de `app.js` num shim mínimo de
+  DOM via Node.js, injeta um payload clássico de XSS e comprova que ele
+  chega como `textContent` puro, sem gerar nenhum nó filho.

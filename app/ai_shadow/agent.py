@@ -58,8 +58,8 @@ class SimulatedProvider:
             "recommendation": rec,
             "confidence": confidence,
             "reasoning_summary": (
-                f"SimulatedProvider comparing fast/slow SMA for {symbol}; "
-                f"no external model consulted."
+                f"Provedor simulado comparando médias móveis rápida/lenta para {symbol}; "
+                f"nenhum modelo externo foi consultado."
             ),
             "risk_flags": [],
             "timestamp": utcnow().isoformat(),

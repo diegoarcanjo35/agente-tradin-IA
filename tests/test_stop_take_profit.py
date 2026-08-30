@@ -129,4 +129,4 @@ def test_both_stop_and_target_touched_same_candle_assumes_stop_first(session_fac
         signals = repo.recent_signals(session, limit=10)
         trigger_signal = next(s for s in signals if s.direction == "SELL")
         assert "stop-loss" in trigger_signal.justification.lower()
-        assert "conservative" in trigger_signal.justification.lower()
+        assert "conservadora" in trigger_signal.justification.lower()

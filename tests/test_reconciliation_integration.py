@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from app.execution.bybit_demo import BybitDemoExecutionEngine
 from app.persistence import repo
 from app.persistence.db import session_scope
-from app.risk.engine import RiskEngine
+from tests.factories import approved_open_order
 from tests.fakes.bybit_fake import FakeBybitTransport
 from tests.test_price_correctness import build_test_orchestrator
 
@@ -27,7 +27,7 @@ def test_reconcile_detects_local_only_position_and_blocks_trading(session_factor
         state = repo.get_or_create_system_state(session)
         assert state.state_ambiguous is True
         assert state.trading_blocked is True
-        assert "RECONCILIATION_MISMATCH" in (state.block_reason or "")
+        assert "reconciliação" in (state.block_reason or "").lower()
         failures = repo.recent_failures(session, limit=10)
         assert any(f.kind == "RECONCILIATION" and not f.resolved for f in failures)
         events = repo.recent_security_events(session, limit=10)
@@ -40,8 +40,7 @@ def test_reconcile_ok_clears_prior_ambiguity(session_factory):
     with session_scope(session_factory) as session:
         state = repo.get_or_create_system_state(session)
         state.state_ambiguous = True
-        state.trading_blocked = True
-        state.block_reason = "RECONCILIATION_MISMATCH: stale from a previous run"
+        repo.recompute_trading_blocked(state, orch.settings.risk_max_api_failures)
         orch.reconcile(session, state)  # no local positions, no remote -> matches
 
     with session_scope(session_factory) as session:
@@ -53,22 +52,19 @@ def test_reconcile_ok_clears_prior_ambiguity(session_factory):
 
 def test_reconcile_does_not_clear_kill_switch_block():
     """A block caused by the kill switch must never be silently lifted by a
-    successful reconciliation -- only RECONCILIATION_MISMATCH blocks are
-    auto-cleared."""
-    from tests.test_price_correctness import build_test_orchestrator as _build
-
+    successful reconciliation -- recompute_trading_blocked() always re-adds
+    the kill-switch reason as long as kill_switch_engaged is still True."""
     def run(session_factory):
-        orch = _build(session_factory, [])
+        orch = build_test_orchestrator(session_factory, [])
         with session_scope(session_factory) as session:
             state = repo.get_or_create_system_state(session)
             state.kill_switch_engaged = True
-            state.trading_blocked = True
-            state.block_reason = "Kill switch engaged manually via dashboard."
+            repo.recompute_trading_blocked(state, orch.settings.risk_max_api_failures)
             orch.reconcile(session, state)
         with session_scope(session_factory) as session:
             state = repo.get_or_create_system_state(session)
             assert state.trading_blocked is True
-            assert state.block_reason == "Kill switch engaged manually via dashboard."
+            assert "emergência" in (state.block_reason or "").lower()
 
     from app.persistence.db import init_db, make_engine, make_session_factory
     engine = make_engine("sqlite:///:memory:")
@@ -107,8 +103,9 @@ def test_reconcile_runs_automatically_after_order_ends_in_error(session_factory)
     orch = build_test_orchestrator(session_factory, [])
     orch.execution_engine = execution_engine
 
-    approved = RiskEngine.make_test_approved_order(
-        signal_id=1, symbol="BTCUSDT", side="BUY", qty=0.01, stop_loss=90.0, take_profit=110.0,
+    approved = approved_open_order(
+        symbol="BTCUSDT", side="BUY", qty=0.01, price=100.0,
+        stop_loss=90.0, take_profit=110.0, signal_id=1,
     )
 
     with session_scope(session_factory) as session:

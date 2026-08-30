@@ -22,17 +22,22 @@ class UnsafeBindHostError(TradingSystemError):
 
 LOCAL_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
-# Only hosts on this allowlist may ever be used as the Bybit base URL. Anything
-# else (including bare "api.bybit.com", the production host) is rejected at
-# config load time, before any HTTP client is constructed.
-ALLOWED_BYBIT_HOSTS = frozenset(
-    {
-        "api-demo.bybit.com",
-        "stream-demo.bybit.com",
-        "api-testnet.bybit.com",
-        "stream-testnet.bybit.com",
-    }
-)
+# Correction v1.2 #6: Fase 1 supports ONLY Bybit's official Demo Trading
+# environment ("demo"), not plain Testnet. Reason: the `pybit` client's
+# HTTP(demo=True, testnet=True) combination resolves to a THIRD host
+# (api-demo-testnet.bybit.com) distinct from both api-demo.bybit.com and
+# api-testnet.bybit.com, and HTTP(testnet=True, demo=False) would silently
+# connect to plain Testnet even if BYBIT_BASE_URL said something else --
+# there was no way for the validated base_url to actually determine which
+# environment the client used. Rather than build bespoke per-host client
+# wiring to support both safely, this phase supports Demo only; a plain
+# Testnet host is deliberately NOT in the allowlist below (see
+# docs/OPERACAO_DEMO.md for the full rationale).
+BYBIT_HOST_ENVIRONMENTS: dict[str, str] = {
+    "api-demo.bybit.com": "demo",
+    "stream-demo.bybit.com": "demo",
+}
+ALLOWED_BYBIT_HOSTS = frozenset(BYBIT_HOST_ENVIRONMENTS.keys())
 
 # Hosts that are known-production and must never be reachable, even if someone
 # tries to sneak them in via .env. Checked explicitly so the failure message is
@@ -52,21 +57,46 @@ class RunMode(str, Enum):
     BYBIT_DEMO = "BYBIT_DEMO"
 
 
-def assert_demo_host(url: str) -> None:
-    """Fail safe: raise unless the host is on the demo/testnet allowlist."""
+def _extract_host(url: str) -> str:
     from urllib.parse import urlparse
 
     host = urlparse(url if "://" in url else f"https://{url}").hostname or url
-    host = host.lower()
+    return host.lower()
+
+
+def assert_demo_host(url: str) -> None:
+    """Fail safe: raise unless the host is on the Bybit Demo Trading allowlist."""
+    host = _extract_host(url)
     if host in KNOWN_PRODUCTION_BYBIT_HOSTS:
         raise ProductionEndpointBlockedError(
-            f"Host '{host}' is a known Bybit PRODUCTION host. Refusing to start."
+            f"Host '{host}' é um host de PRODUÇÃO conhecido da Bybit. Inicialização recusada."
         )
     if host not in ALLOWED_BYBIT_HOSTS:
         raise ProductionEndpointBlockedError(
-            f"Host '{host}' is not on the Bybit demo/testnet allowlist "
-            f"({sorted(ALLOWED_BYBIT_HOSTS)}). Refusing to start."
+            f"Host '{host}' não está na lista permitida de hosts Bybit Demo Trading "
+            f"({sorted(ALLOWED_BYBIT_HOSTS)}). Inicialização recusada."
         )
+
+
+def get_host_environment(url: str) -> str:
+    """Raises via assert_demo_host() if the host isn't allowed; otherwise
+    returns its Bybit environment tag ("demo")."""
+    assert_demo_host(url)
+    return BYBIT_HOST_ENVIRONMENTS[_extract_host(url)]
+
+
+def assert_consistent_bybit_environment(base_url: str, ws_url: str) -> str:
+    """Both the REST base URL and the WebSocket URL must resolve to the SAME
+    Bybit environment. Raises before any client/network object is built if
+    they disagree (e.g. one demo, one pointing somewhere else)."""
+    base_env = get_host_environment(base_url)
+    ws_env = get_host_environment(ws_url)
+    if base_env != ws_env:
+        raise ProductionEndpointBlockedError(
+            f"BYBIT_BASE_URL (ambiente '{base_env}') e BYBIT_WS_URL (ambiente '{ws_env}') "
+            "não correspondem ao mesmo ambiente Bybit. Inicialização recusada."
+        )
+    return base_env
 
 
 class Settings(BaseSettings):
@@ -82,6 +112,14 @@ class Settings(BaseSettings):
     database_url: str = Field(default="sqlite:///./agente_trader.db")
 
     symbol: str = Field(default="BTCUSDT")
+
+    # Correction v1.2 #2: conservative, configurable polling cadence for
+    # BYBIT_DEMO -- for a 1-minute timeframe there is no reason to poll
+    # dozens of times per second (see docs/OPERACAO_DEMO.md). REPLAY/
+    # PAPER_LOCAL use a separate, much faster interval since they never
+    # touch a real rate-limited API.
+    bybit_poll_interval_seconds: float = Field(default=5.0)
+    replay_poll_interval_seconds: float = Field(default=0.02)
 
     # Risk defaults (conservative). See app/risk/config.py for the dataclass
     # these seed and full documentation of each limit.
@@ -122,17 +160,17 @@ class Settings(BaseSettings):
     def require_bybit_credentials(self) -> None:
         if not self.bybit_api_key or not self.bybit_api_secret:
             raise ProductionEndpointBlockedError(
-                "BYBIT_DEMO mode requires BYBIT_API_KEY and BYBIT_API_SECRET "
-                "to be set via environment variables."
+                "O modo BYBIT_DEMO exige BYBIT_API_KEY e BYBIT_API_SECRET "
+                "configurados via variáveis de ambiente."
             )
 
     def assert_safe_bind_host(self) -> None:
         if self.api_host not in LOCAL_BIND_HOSTS and not self.api_allow_external_bind:
             raise UnsafeBindHostError(
-                f"API_HOST={self.api_host!r} is not a local address and "
-                "API_ALLOW_EXTERNAL_BIND is not set. The control API "
-                "(kill switch, etc.) has no authentication in this phase; "
-                "refusing to start bound to a non-local address by accident."
+                f"API_HOST={self.api_host!r} não é um endereço local e "
+                "API_ALLOW_EXTERNAL_BIND não está habilitado. A API de controle "
+                "(bloqueio de emergência, etc.) não possui autenticação nesta fase; "
+                "inicialização recusada para evitar exposição acidental."
             )
 
 
@@ -140,8 +178,7 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     settings = Settings()
     if settings.mode == RunMode.BYBIT_DEMO:
-        assert_demo_host(settings.bybit_base_url)
-        assert_demo_host(settings.bybit_ws_url)
+        assert_consistent_bybit_environment(settings.bybit_base_url, settings.bybit_ws_url)
         settings.require_bybit_credentials()
     settings.assert_safe_bind_host()
     return settings
