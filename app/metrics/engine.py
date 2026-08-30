@@ -145,13 +145,24 @@ def compute_metrics(
     closed_trades: list[ClosedTrade],
     starting_balance: float,
     open_exposure_usd: float | None = None,
+    funding_total: float | None = None,
 ) -> MetricsResult:
+    """Correção v1.1 #6: `funding_total`, when given (a real collected SUM
+    from app.persistence.repo.funding_total -- only ever available for
+    BYBIT_DEMO), is reported as `funding` and contributes to `net_profit`.
+    `None` (no funding_provider at all -- REPLAY/PAPER_LOCAL/PAPER_LIVE)
+    keeps the exact pre-existing UNAVAILABLE behavior; it is never
+    conflated with a genuine 0.0 (no funding settled yet, but a provider
+    exists and reached the exchange)."""
+    funding: Metric = funding_total if funding_total is not None else UNAVAILABLE
+    funding_component = funding_total if funding_total is not None else 0.0
+
     n = len(closed_trades)
     if n == 0:
         return MetricsResult(
             period_start=UNAVAILABLE, period_end=UNAVAILABLE, closed_trades_count=0,
             gross_profit=UNAVAILABLE, gross_loss=UNAVAILABLE, net_profit=UNAVAILABLE,
-            commissions=UNAVAILABLE, funding=UNAVAILABLE, win_rate=UNAVAILABLE,
+            commissions=UNAVAILABLE, funding=funding, win_rate=UNAVAILABLE,
             avg_win=UNAVAILABLE, avg_loss=UNAVAILABLE, payoff=UNAVAILABLE,
             profit_factor=UNAVAILABLE, expectancy=UNAVAILABLE, max_win_streak=0,
             max_loss_streak=0, max_drawdown_money=UNAVAILABLE, max_drawdown_pct=UNAVAILABLE,
@@ -169,7 +180,7 @@ def compute_metrics(
     gross_profit = sum(wins)
     gross_loss = sum(losses)  # negative or zero
     commissions = sum(fees)
-    net_profit = gross_profit + gross_loss - commissions
+    net_profit = gross_profit + gross_loss - commissions + funding_component
 
     win_rate = len(wins) / n
     avg_win = (gross_profit / len(wins)) if wins else UNAVAILABLE
@@ -214,7 +225,7 @@ def compute_metrics(
         gross_loss=gross_loss,
         net_profit=net_profit,
         commissions=commissions,
-        funding=UNAVAILABLE,  # Bybit funding fee feed not wired in Fase 1.
+        funding=funding,
         win_rate=win_rate,
         avg_win=avg_win,
         avg_loss=avg_loss,

@@ -8,6 +8,19 @@ through RiskEngine.evaluate() or RiskEngine.evaluate_close() in this file.
 Correction v1.1: closing a position (opposing signal or a stop-loss/
 take-profit touch) now goes through RiskEngine.evaluate_close() -- it no
 longer fabricates an ApprovedOrder directly. See app/risk/engine.py.
+
+Correção v1.1 (Fase 2, réplica): `submit()` no longer blocks waiting for
+confirmation -- see app/execution/base.py::SubmitAck/OrderStatusSnapshot.
+The normal path here always calls `poll_order()` once immediately after a
+successful submit (so PAPER_LOCAL/PAPER_LIVE and a fast-confirming
+BYBIT_DEMO fake still resolve within the same tick, preserving every
+existing regression test), and `_poll_open_orders()` re-polls anything
+still non-terminal on a configurable periodic cadence -- this is what makes
+a process restart with an order in flight, or a real exchange that takes
+longer than one tick to fill, actually work instead of hanging or
+re-submitting. Every fill, from any of these paths, is applied through the
+single `app/execution/fill_service.py::apply_order_snapshot` -- there is no
+second place that touches Execution/Position/session counters.
 """
 from __future__ import annotations
 
@@ -17,10 +30,12 @@ from app.ai_shadow.agent import AIShadowAgent
 from app.core.clock import RemoteTimeProvider, compute_clock_sync, utcnow
 from app.core.config import Settings
 from app.core.logging import get_logger, log_event
+from app.execution import fill_service
 from app.execution.base import ExecutionEngine
+from app.execution.funding import BybitFundingProvider, record_new_funding_events
 from app.execution.idempotency import make_idempotency_key
-from app.execution.order_state import OrderStatus
-from app.execution.reconciliation import reconcile_positions
+from app.execution.order_state import OrderStatus, is_terminal
+from app.execution.reconciliation import reconcile_orders, reconcile_positions
 from app.market_data.base import CandleFetchStatus, MarketDataProvider
 from app.persistence import repo
 from app.persistence.models import OperationalSession
@@ -35,6 +50,14 @@ def _today_start_utc(now: datetime) -> datetime:
     return datetime.combine(now.date(), time.min, tzinfo=timezone.utc)
 
 
+def _reattach_utc(value: datetime | None) -> datetime | None:
+    """SQLite round-trips DateTime(timezone=True) as naive regardless of
+    what was stored -- never compare naive vs. aware."""
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -47,6 +70,7 @@ class Orchestrator:
         ai_agent: AIShadowAgent | None,
         clock_provider: RemoteTimeProvider,
         price_state: dict[str, float] | None = None,
+        funding_provider: "BybitFundingProvider | None" = None,
     ):
         self.settings = settings
         self.session_factory = session_factory
@@ -60,6 +84,12 @@ class Orchestrator:
         # was built with; the orchestrator is the single writer, updated
         # from the candle that is actually driving each decision.
         self.price_state: dict[str, float] = price_state if price_state is not None else {}
+        self._last_open_order_poll_at: datetime | None = None
+        # Correção v1.1 #6: only ever set for BYBIT_DEMO (the only mode
+        # with private-endpoint credentials) -- None means funding stays
+        # UNAVAILABLE rather than a fabricated/simulated value.
+        self.funding_provider = funding_provider
+        self._last_funding_poll_at: datetime | None = None
 
     def tick(self) -> dict:
         from app.persistence.db import session_scope
@@ -77,13 +107,7 @@ class Orchestrator:
             # runs one real reconciliation at startup before the first tick
             # in production; this only matters for tests that build an
             # Orchestrator directly without that startup call.
-            # SQLite round-trips DateTime(timezone=True) as naive regardless
-            # of what was stored (same defense as
-            # repo.get_last_candle_open_time) -- never compare naive vs.
-            # aware.
-            last_reconciliation_at = state.last_reconciliation_at
-            if last_reconciliation_at is not None and last_reconciliation_at.tzinfo is None:
-                last_reconciliation_at = last_reconciliation_at.replace(tzinfo=timezone.utc)
+            last_reconciliation_at = _reattach_utc(state.last_reconciliation_at)
 
             if last_reconciliation_at is not None:
                 elapsed = (utcnow() - last_reconciliation_at).total_seconds()
@@ -97,6 +121,13 @@ class Orchestrator:
             else:
                 state.reconciliation_stale = False
             repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
+
+            # Correção v1.1 #1: real, persistent order-status polling -- an
+            # order still non-terminal from a prior tick (or a prior
+            # process, before a restart) is re-polled here on a configurable
+            # cadence, never left hanging and never re-submitted.
+            self._maybe_poll_open_orders(session, state)
+            self._maybe_collect_funding(session, state)
 
             # Correction v1.4 #2: before polling, tell the provider the last
             # candle actually persisted for its symbol/timeframe -- cheap
@@ -393,6 +424,26 @@ class Orchestrator:
             common_fields, signal.observed_price, bucket,
         )
 
+    def _submit_and_track(self, session, state, order_row, approved, reference_price: float):
+        """Correção v1.1 #1: the shared submit -> transition -> (immediate)
+        poll -> apply-fill sequence used by both entry and close orders.
+        Returns `(ack, snapshot_result)` -- `snapshot_result` is None when
+        the exchange never even accepted the order (REJECTED/UNKNOWN)."""
+        ack = self.execution_engine.submit(approved, order_row.idempotency_key, reference_price=reference_price)
+        if ack.exchange_order_id:
+            order_row.exchange_order_id = ack.exchange_order_id
+        repo.transition_order_status(session, order_row, ack.status, detail=f"submit(): {ack.status.value}.")
+
+        if ack.status != OrderStatus.SUBMITTED:
+            return ack, None
+
+        snapshot = self.execution_engine.poll_order(ack.exchange_order_id)
+        result = fill_service.apply_order_snapshot(
+            session, state, self._active_session(session, state), order_row, snapshot,
+            is_close=order_row.is_close, max_api_failures=self.settings.risk_max_api_failures,
+        )
+        return ack, result
+
     def _close_position_via_risk(
         self, session, state, position, close_side: str, qty: float, signal_id: int,
         common_fields: dict, trigger_price: float, idempotency_bucket: str,
@@ -426,32 +477,35 @@ class Orchestrator:
         )
         increment_session_counter(self._active_session(session, state), "orders_count")
 
-        fill = self.execution_engine.submit(approved, key, reference_price=trigger_price)
-        self._apply_fill_to_order(session, state, order_row, fill)
+        ack, result = self._submit_and_track(session, state, order_row, approved, trigger_price)
 
-        if fill.status not in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
+        if result is None:
             state.api_failure_count += 1
             repo.record_failure(
                 session, "FAILURE",
-                f"Ordem de fechamento {order_row.id} terminou com status={fill.status.value}.",
+                f"Ordem de fechamento {order_row.id} não foi aceita pela corretora (status={ack.status.value}).",
             )
             increment_session_counter(self._active_session(session, state), "failures_count")
             self.reconcile(session, state)
-            return {"status": "close_failed", "order_status": fill.status.value, "order_id": order_row.id}
+            return {"status": "close_failed", "order_status": ack.status.value, "order_id": order_row.id}
 
-        repo.save_execution(session, order_row.id, fill.fill_qty, fill.fill_price, fill.fee, fill.is_partial)
+        if result.new_fill_count == 0:
+            if result.status == OrderStatus.UNKNOWN:
+                state.api_failure_count += 1
+                repo.record_failure(
+                    session, "FAILURE",
+                    f"Ordem de fechamento {order_row.id} terminou com status={result.status.value}.",
+                )
+                increment_session_counter(self._active_session(session, state), "failures_count")
+                self.reconcile(session, state)
+                return {"status": "close_failed", "order_status": result.status.value, "order_id": order_row.id}
+            # Accepted, still no fill yet (real exchange not-yet-filled) --
+            # the periodic poller (_poll_open_orders) will pick it up.
+            return {"status": "close_pending", "order_id": order_row.id, "order_status": result.status.value}
 
-        direction = 1 if position.side == "BUY" else -1
-        realized_pnl_delta = direction * (fill.fill_price - position.avg_entry_price) * fill.fill_qty
-
-        closed_fully = fill.fill_qty >= position.qty - 1e-9
+        closed_fully = bool(result.closed_fully)
         if closed_fully:
-            repo.close_position(session, position, realized_pnl_delta, fill.fee)
-        else:
-            repo.reduce_position(session, position, fill.fill_qty, realized_pnl_delta, fill.fee)
-
-        if closed_fully:
-            if realized_pnl_delta < 0:
+            if result.realized_pnl_delta_total < 0:
                 state.consecutive_losses += 1
             else:
                 state.consecutive_losses = 0
@@ -465,10 +519,10 @@ class Orchestrator:
                 log_event(logger, 30, "cooldown_engaged", consecutive_losses=state.consecutive_losses)
 
         log_event(logger, 20, "position_closed" if closed_fully else "position_reduced",
-                  symbol=position.symbol, realized_pnl=realized_pnl_delta, order_id=order_row.id)
+                  symbol=position.symbol, realized_pnl=result.realized_pnl_delta_total, order_id=order_row.id)
         return {
             "status": "position_closed" if closed_fully else "position_reduced",
-            "realized_pnl": realized_pnl_delta, "order_id": order_row.id,
+            "realized_pnl": result.realized_pnl_delta_total, "order_id": order_row.id,
         }
 
     def _submit_and_record(self, session, state, risk_evaluation_id: int, approved,
@@ -485,69 +539,161 @@ class Orchestrator:
         )
         increment_session_counter(self._active_session(session, state), "orders_count")
 
-        fill = self.execution_engine.submit(approved, key, reference_price=candle_close)
-        self._apply_fill_to_order(session, state, order_row, fill)
+        ack, result = self._submit_and_track(session, state, order_row, approved, candle_close)
 
-        if fill.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
-            repo.save_execution(session, order_row.id, fill.fill_qty, fill.fill_price, fill.fee, fill.is_partial)
-            repo.open_position(
-                session, approved.symbol, approved.side, fill.fill_qty, fill.fill_price,
-                approved.stop_loss, approved.take_profit, opening_fee=fill.fee,
+        if result is None:
+            state.api_failure_count += 1
+            repo.record_failure(
+                session, "FAILURE",
+                f"Ordem {order_row.id} não foi aceita pela corretora (status={ack.status.value}).",
             )
+            increment_session_counter(self._active_session(session, state), "failures_count")
+            self.reconcile(session, state)
+            return {"status": "order_not_filled", "order_status": ack.status.value}
+
+        if result.new_fill_count > 0:
             return {"status": "order_filled", "order_id": order_row.id}
 
-        state.api_failure_count += 1
-        repo.record_failure(session, "FAILURE", f"Ordem {order_row.id} terminou com status={fill.status.value}.")
-        increment_session_counter(self._active_session(session, state), "failures_count")
-        self.reconcile(session, state)
-        return {"status": "order_not_filled", "order_status": fill.status.value}
+        if result.status == OrderStatus.UNKNOWN:
+            state.api_failure_count += 1
+            repo.record_failure(session, "FAILURE", f"Ordem {order_row.id} terminou com status={result.status.value}.")
+            increment_session_counter(self._active_session(session, state), "failures_count")
+            self.reconcile(session, state)
+            return {"status": "order_not_filled", "order_status": result.status.value}
 
-    def _apply_fill_to_order(self, session, state, order_row, fill) -> None:
-        """Fase 2, item 7.2: books `fill` onto `order_row` through the
-        enforced state machine (never a bare `order_row.status = ...`
-        assignment). FILLED/PARTIALLY_FILLED go through `record_fill`
-        (cumulative bookkeeping); REJECTED/UNKNOWN transition directly --
-        both are legal successors of PENDING_SUBMIT (see
-        app.execution.order_state). Always re-derives
-        SystemState.order_state_unknown afterward, since an order landing
-        in (or leaving) UNKNOWN changes whether new exposure may be opened.
-        """
-        order_row.exchange_order_id = fill.exchange_order_id
+        # Accepted, still no fill yet -- the periodic poller picks it up.
+        return {"status": "order_pending", "order_id": order_row.id, "order_status": result.status.value}
+
+    def _maybe_poll_open_orders(self, session, state) -> None:
+        """Correção v1.1 #1: periodic, persistent order-status polling --
+        gated by `open_order_poll_interval_seconds` so this doesn't hammer
+        the exchange every tick. Every non-terminal order still tracked
+        locally is re-polled and its fills (if any) applied through the
+        exact same `fill_service.apply_order_snapshot` used by the
+        immediate post-submit poll and the kill switch -- one code path,
+        never a second one."""
+        now = utcnow()
+        last = self._last_open_order_poll_at
+        if last is not None and (now - last).total_seconds() < self.settings.open_order_poll_interval_seconds:
+            return
+        self._last_open_order_poll_at = now
+
         op_session = self._active_session(session, state)
-        if fill.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
-            repo.record_fill(
-                session, order_row, fill.status,
-                cumulative_filled_qty=fill.fill_qty, avg_fill_price=fill.fill_price,
-                fees_total=fill.fee,
+        for order in repo.non_terminal_orders(session, mode=self.settings.mode.value):
+            if not order.exchange_order_id:
+                continue  # never actually reached the exchange -- nothing to poll yet
+            if is_terminal(OrderStatus(order.status)):
+                continue
+            snapshot = self.execution_engine.poll_order(order.exchange_order_id)
+            fill_service.apply_order_snapshot(
+                session, state, op_session, order, snapshot,
+                is_close=order.is_close, max_api_failures=self.settings.risk_max_api_failures,
             )
-            increment_session_counter(op_session, "fills_count")
-        else:
-            repo.transition_order_status(
-                session, order_row, fill.status,
-                detail=f"Resultado de submit(): {fill.status.value}.",
-            )
-        state.order_state_unknown = repo.has_unknown_orders(session)
-        repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
+            self._maybe_apply_partial_fill_policy(session, state, op_session, order, now)
+
+    def _maybe_collect_funding(self, session, state) -> None:
+        """Correção v1.1 #6: periodic, idempotent funding collection --
+        only when `funding_provider` was actually wired (BYBIT_DEMO; never
+        PAPER_LIVE, which has no private credentials -- see
+        app/api/main.py::build_orchestrator). Gated by
+        `funding_poll_interval_seconds`, same periodic-gate pattern as
+        `_maybe_poll_open_orders`. `since` is the latest `occurred_at`
+        already on file for the symbol -- purely an optimization (dedup by
+        `funding_id` is what actually makes this idempotent, not the
+        cursor), so it never needs its own persistent state column."""
+        if self.funding_provider is None:
+            return
+        now = utcnow()
+        last = self._last_funding_poll_at
+        if last is not None and (now - last).total_seconds() < self.settings.funding_poll_interval_seconds:
+            return
+        self._last_funding_poll_at = now
+
+        since = repo.last_funding_occurred_at(session, self.settings.symbol)
+        try:
+            records = self.funding_provider.list_funding(self.settings.symbol, since=since)
+        except Exception as exc:  # noqa: BLE001 - a funding-collection failure never blocks trading
+            detail = f"Não foi possível coletar funding da corretora: {exc}"
+            repo.record_failure(session, "FAILURE", detail)
+            repo.record_security_event(session, "FUNDING_COLLECTION_FAILED", detail)
+            return
+        record_new_funding_events(session, records)
+
+    def _maybe_apply_partial_fill_policy(self, session, state, op_session, order, now) -> None:
+        """Correção v1.1 #2/#5: an order stuck PARTIALLY_FILLED longer than
+        `partial_fill_timeout_seconds` is handled per `partial_fill_policy`
+        -- WAIT (default) never times out; CANCEL_REMAINDER and
+        EXPIRE_AND_CANCEL both request cancellation of the unfilled
+        remainder, through the exact same CANCEL_PENDING -> request_cancel
+        -> poll -> fill_service path used everywhere else (never a second,
+        divergent cancellation code path)."""
+        if OrderStatus(order.status) != OrderStatus.PARTIALLY_FILLED:
+            return
+        policy = self.settings.partial_fill_policy
+        if policy == "WAIT":
+            return
+        stalled_for = (now - _reattach_utc(order.updated_at)).total_seconds()
+        if stalled_for <= self.settings.partial_fill_timeout_seconds:
+            return
+
+        repo.transition_order_status(
+            session, order, OrderStatus.CANCEL_PENDING,
+            detail=f"Prazo de fill parcial excedido ({policy}, {stalled_for:.0f}s).",
+        )
+        self.execution_engine.request_cancel(order.exchange_order_id)
+        cancel_snapshot = self.execution_engine.poll_order(order.exchange_order_id)
+        fill_service.apply_order_snapshot(
+            session, state, op_session, order, cancel_snapshot,
+            is_close=order.is_close, max_api_failures=self.settings.risk_max_api_failures,
+        )
 
     def reconcile(self, session, state) -> None:
-        """Compares locally persisted OPEN positions against what the
-        execution engine reports for the exchange. Runs at orchestrator
+        """Compares locally persisted state against what the execution
+        engine reports for the exchange -- both positions (Fase 1) and,
+        since correção v1.1 #3, open orders (an order the exchange has that
+        isn't tracked locally, or one tracked locally as non-terminal that
+        the exchange no longer reports as open). Runs at orchestrator
         construction time (startup / after a restart), whenever an order
-        submission ends in an unresolved/error status, and now also
-        periodically (Fase 2, item 7.4 -- see the top of `tick()`). Any
-        mismatch, or failure to even reach the exchange, sets
-        state_ambiguous=True (unchanged since Fase 1) AND the new, more
-        specifically-named `reconciliation_diverged` flag (Fase 2, item
-        7.5) in parallel -- TRADING_BLOCKED is then derived by
-        repo.recompute_trading_blocked() alongside every other block source
-        (correction v1.2 #5), so disengaging the kill switch can never clear
-        a block caused by a reconciliation problem. `last_reconciliation_at`
-        is always stamped, whatever the outcome, so staleness tracking
-        reflects the most recent attempt, not just the most recent success.
+        submission ends in an unresolved/error status, and periodically
+        (Fase 2, item 7.4 -- see the top of `tick()`).
+
+        Position reconciliation and order reconciliation each run in their
+        OWN try/except, each persisting their own structured result --
+        correção v1.1 #3 item 7 explicitly requires that a failure in one
+        half is never masked by the other half succeeding. The combined
+        `reconciliation_diverged`/`state_ambiguous` is only cleared when
+        BOTH halves reach the exchange and find no mismatch (a logical
+        AND) -- a divergence found by either half, or a failure to even
+        reach the exchange for either half, keeps the system blocked.
+        `last_reconciliation_at` is always stamped once, whatever the
+        outcome, so staleness tracking reflects the most recent attempt,
+        not just the most recent success. Both structured results are
+        persisted via `repo.record_failure(..., mismatches=...)`
+        (correção v1.1 #3) so a result can be inspected programmatically,
+        not just read as a paragraph.
         """
-        increment_session_counter(self._active_session(session, state), "reconciliations_count")
+        op_session = self._active_session(session, state)
+        increment_session_counter(op_session, "reconciliations_count")
+        state.last_reconciliation_at = utcnow()
+
+        position_ok = self._reconcile_positions_step(session, state, op_session)
+        order_ok = self._reconcile_orders_step(session, state, op_session)
+
+        # Fase 2, item 7.7/7.8: a reconciliation that actually completed at
+        # least its position half (reached the exchange and compared,
+        # whether or not it found a mismatch) satisfies the "reconciliação
+        # inicial concluída" gate.
+        if position_ok is not None:
+            state.initialization_not_reconciled = False
+        state.reconciliation_diverged = not (position_ok and order_ok)
+        state.state_ambiguous = state.reconciliation_diverged
+        repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
+
+    def _reconcile_positions_step(self, session, state, op_session) -> bool | None:
+        """Returns True (clean), False (diverged), or None (couldn't even
+        reach the exchange to compare)."""
         local_positions = [
-            {"symbol": p.symbol, "side": p.side, "qty": p.qty}
+            {"symbol": p.symbol, "side": p.side, "qty": p.qty, "avg_entry_price": p.avg_entry_price}
             for p in repo.open_positions(session)
         ]
         symbols = {p["symbol"] for p in local_positions}
@@ -558,36 +704,78 @@ class Orchestrator:
             for symbol in symbols:
                 remote_by_symbol[symbol] = self.execution_engine.get_position(symbol)
         except Exception as exc:  # noqa: BLE001 - any failure to verify blocks trading
-            state.state_ambiguous = True
-            state.reconciliation_diverged = True
-            state.last_reconciliation_at = utcnow()
-            repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
             detail = f"Não foi possível consultar as posições na corretora para reconciliação: {exc}"
-            repo.record_failure(session, "RECONCILIATION", detail)
+            repo.record_failure(session, "RECONCILIATION", detail, session_id=op_session.id if op_session else None)
             repo.record_security_event(session, "RECONCILIATION_FAILED", detail)
-            return
+            return None
 
         report = reconcile_positions(local_positions, remote_by_symbol)
-        state.last_reconciliation_at = utcnow()
-        # Fase 2, item 7.7/7.8: a reconciliation that actually COMPLETED
-        # (reached the exchange and compared, whether or not it found a
-        # mismatch) satisfies the "reconciliação inicial concluída" gate --
-        # the exception branch above does NOT reach here, so it correctly
-        # never clears this.
-        state.initialization_not_reconciled = False
         if report.ok:
-            state.state_ambiguous = False
-            state.reconciliation_diverged = False
-            repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
             repo.record_failure(
                 session, "RECONCILIATION",
-                "Reconciliação OK: posições locais e da corretora coincidem.",
-                resolved=True,
+                "Reconciliação de posições OK: posições locais e da corretora coincidem.",
+                resolved=True, mismatches=report.mismatches,
+                session_id=op_session.id if op_session else None,
             )
-        else:
-            state.state_ambiguous = True
-            state.reconciliation_diverged = True
-            repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
-            detail = "Divergência de reconciliação: " + "; ".join(report.mismatches)
-            repo.record_failure(session, "RECONCILIATION", detail)
-            repo.record_security_event(session, "RECONCILIATION_MISMATCH", detail)
+            return True
+
+        detail = "Divergência de reconciliação de posições: " + "; ".join(report.mismatches)
+        repo.record_failure(
+            session, "RECONCILIATION", detail, mismatches=report.mismatches,
+            session_id=op_session.id if op_session else None,
+        )
+        repo.record_security_event(session, "RECONCILIATION_MISMATCH", detail)
+        return False
+
+    def _reconcile_orders_step(self, session, state, op_session) -> bool | None:
+        """Correção v1.1 #3: (a) re-polls every locally non-terminal order
+        to recover any fill missed by the periodic poller (through the same
+        `fill_service.apply_order_snapshot` used everywhere else -- never a
+        second path), then (b) compares the now-current set of locally
+        non-terminal orders against `list_open_orders()` to detect an order
+        the exchange has that isn't tracked locally at all. Returns True
+        (clean), False (diverged), or None (couldn't reach the exchange)."""
+        local_orders = repo.non_terminal_orders(session, mode=self.settings.mode.value)
+        symbols = {o.symbol for o in local_orders}
+        symbols.add(self.settings.symbol)
+        try:
+            for order in local_orders:
+                if not order.exchange_order_id or is_terminal(OrderStatus(order.status)):
+                    continue
+                snapshot = self.execution_engine.poll_order(order.exchange_order_id)
+                fill_service.apply_order_snapshot(
+                    session, state, op_session, order, snapshot,
+                    is_close=order.is_close, max_api_failures=self.settings.risk_max_api_failures,
+                )
+
+            remote_open_orders: list[dict] = []
+            for symbol in symbols:
+                remote_open_orders.extend(self.execution_engine.list_open_orders(symbol))
+        except Exception as exc:  # noqa: BLE001 - any failure to verify blocks trading
+            detail = f"Não foi possível consultar as ordens abertas na corretora para reconciliação: {exc}"
+            repo.record_failure(session, "RECONCILIATION", detail, session_id=op_session.id if op_session else None)
+            repo.record_security_event(session, "RECONCILIATION_FAILED", detail)
+            return None
+
+        local_open_orders = [
+            {"exchange_order_id": o.exchange_order_id, "side": o.side, "qty": o.qty}
+            for o in repo.non_terminal_orders(session, mode=self.settings.mode.value)
+            if o.exchange_order_id
+        ]
+        report = reconcile_orders(local_open_orders, remote_open_orders)
+        if report.ok:
+            repo.record_failure(
+                session, "RECONCILIATION",
+                "Reconciliação de ordens OK: ordens locais e da corretora coincidem.",
+                resolved=True, mismatches=report.mismatches,
+                session_id=op_session.id if op_session else None,
+            )
+            return True
+
+        detail = "Divergência de reconciliação de ordens: " + "; ".join(report.mismatches)
+        repo.record_failure(
+            session, "RECONCILIATION", detail, mismatches=report.mismatches,
+            session_id=op_session.id if op_session else None,
+        )
+        repo.record_security_event(session, "RECONCILIATION_MISMATCH", detail)
+        return False

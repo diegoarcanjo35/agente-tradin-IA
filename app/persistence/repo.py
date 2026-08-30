@@ -17,8 +17,8 @@ from app.persistence.models import (
     AccountSnapshot,
     AIRecommendation,
     Candle,
-    Execution,
     FailureReconciliation,
+    FundingEvent,
     Order,
     OrderEvent,
     Position,
@@ -100,8 +100,19 @@ def record_security_event(session: Session, event_type: str, detail: str) -> Sec
     return ev
 
 
-def record_failure(session: Session, kind: str, detail: str, resolved: bool = False) -> FailureReconciliation:
-    fr = FailureReconciliation(kind=kind, detail=detail, resolved=resolved)
+def record_failure(
+    session: Session, kind: str, detail: str, resolved: bool = False,
+    mismatches: list[str] | None = None, order_id: int | None = None, session_id: int | None = None,
+) -> FailureReconciliation:
+    """Correção v1.1 #3: `mismatches`, when given, is persisted as a
+    structured JSON array alongside the Portuguese `detail` summary -- so
+    a reconciliation result can be inspected programmatically, not just
+    read as a paragraph."""
+    fr = FailureReconciliation(
+        kind=kind, detail=detail, resolved=resolved,
+        mismatches_json=json.dumps(mismatches) if mismatches is not None else None,
+        order_id=order_id, session_id=session_id,
+    )
     session.add(fr)
     session.flush()
     return fr
@@ -256,40 +267,6 @@ def transition_order_status(
     session.flush()
 
 
-def record_fill(
-    session: Session, order: Order, new_status: OrderStatus,
-    cumulative_filled_qty: float, avg_fill_price: float, fees_total: float,
-    detail: str | None = None,
-) -> None:
-    """Fase 2, item 7.2: books a fill using SET semantics (not increment) --
-    `cumulative_filled_qty`/`avg_fill_price`/`fees_total` are the order's
-    TOTAL state after this fill, exactly as Bybit's `cumExecQty`/`avgPrice`/
-    `cumExecFee` report it. This is what makes a second, later partial fill
-    (PARTIALLY_FILLED -> PARTIALLY_FILLED) or the eventual completion
-    (PARTIALLY_FILLED -> FILLED) safe to record without ever double-adding
-    quantity/fees -- the caller never needs to track which individual fill
-    was "already recorded," only the exchange's own running totals. It does
-    NOT make calling this twice with an unchanged TERMINAL status safe --
-    `transition_order_status` (used internally) correctly rejects a
-    terminal-to-itself transition, since a status poll that found nothing
-    new should simply not call this again (check `is_terminal(order.status)`
-    first)."""
-    transition_order_status(session, order, new_status, detail=detail)
-    order.filled_qty = cumulative_filled_qty
-    order.avg_fill_price = avg_fill_price
-    order.fees_total = fees_total
-    session.flush()
-
-
-def save_execution(session: Session, order_id: int, fill_qty: float, fill_price: float,
-                    fee: float, is_partial: bool) -> Execution:
-    ex = Execution(order_id=order_id, fill_qty=fill_qty, fill_price=fill_price,
-                    fee=fee, is_partial=is_partial)
-    session.add(ex)
-    session.flush()
-    return ex
-
-
 def open_position(session: Session, symbol: str, side: str, qty: float,
                    avg_entry_price: float, stop_loss: float | None, take_profit: float | None,
                    opening_fee: float = 0.0) -> Position:
@@ -351,6 +328,34 @@ def closed_positions(session: Session, symbol: str | None = None) -> list[Positi
     if symbol:
         stmt = stmt.where(Position.symbol == symbol)
     return list(session.execute(stmt).scalars().all())
+
+
+def last_funding_occurred_at(session: Session, symbol: str) -> datetime | None:
+    """Correção v1.1 #6: the latest `occurred_at` already on file for
+    `symbol` -- used only as an optimization for the `since` window of the
+    next collection poll (idempotency itself comes from the `funding_id`
+    unique index, not from this cursor, so a stale/None value here is
+    always safe, never a correctness risk)."""
+    row = session.execute(
+        select(FundingEvent.occurred_at)
+        .where(FundingEvent.symbol == symbol)
+        .order_by(FundingEvent.occurred_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    return row if row.tzinfo is not None else row.replace(tzinfo=timezone.utc)
+
+
+def funding_total(session: Session, symbol: str | None = None) -> float:
+    """Correção v1.1 #6: the real SUM of collected funding -- 0.0 is a
+    genuine, correct total when no funding has settled yet (never confused
+    with UNAVAILABLE, which app.metrics.engine reports only when there is
+    no funding_provider at all to have collected anything with)."""
+    stmt = select(FundingEvent.amount)
+    if symbol:
+        stmt = stmt.where(FundingEvent.symbol == symbol)
+    return sum(session.execute(stmt).scalars().all())
 
 
 def save_account_snapshot(session: Session, balance: float, equity: float,

@@ -106,10 +106,9 @@ class Order(Base):
     status: Mapped[str] = mapped_column(String(16), default="PENDING_SUBMIT")
     exchange_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     mode: Mapped[str] = mapped_column(String(16))  # PAPER_LOCAL | PAPER_LIVE | BYBIT_DEMO
-    # Fase 2, item 7.2: cumulative fill bookkeeping across possibly multiple
-    # fills of the same order -- SET semantics (not incremented), so
-    # repeated confirmation polls of the same exchange order never double
-    # count. See app.persistence.repo.record_fill().
+    # Correção v1.1 #2: cumulative fill bookkeeping, always RE-DERIVED from
+    # the full set of persisted `executions` rows for this order (never
+    # summed/overwritten ad hoc) -- see app.execution.fill_ledger.
     filled_qty: Mapped[float] = mapped_column(Float, default=0.0)
     avg_fill_price: Mapped[float] = mapped_column(Float, default=0.0)
     fees_total: Mapped[float] = mapped_column(Float, default=0.0)
@@ -143,9 +142,20 @@ class OrderEvent(Base):
 
 class Execution(Base):
     __tablename__ = "executions"
+    __table_args__ = (
+        UniqueConstraint("order_id", "exchange_fill_id", name="uq_execution_order_exchange_fill_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"))
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), index=True)
+    # Correção v1.1 #2: the exchange's own fill/execution identifier (Bybit
+    # execId; a locally synthesized but stable id for PAPER engines).
+    # Nullable only because a pre-Fase-2.1 row migrated from an older
+    # schema never had one -- every row written by app.execution.fill_ledger
+    # always sets it. The unique constraint above is what makes applying
+    # the same fill twice a safe no-op at the database level, not just by
+    # convention.
+    exchange_fill_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     fill_qty: Mapped[float] = mapped_column(Float)
     fill_price: Mapped[float] = mapped_column(Float)
     fee: Mapped[float] = mapped_column(Float, default=0.0)
@@ -207,6 +217,28 @@ class FailureReconciliation(Base):
     # no single order to point at.
     order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"), nullable=True)
     session_id: Mapped[int | None] = mapped_column(ForeignKey("operational_sessions.id"), nullable=True)
+    # Correção v1.1 #3: structured mismatch list (JSON array of strings),
+    # alongside `detail` (still the human-readable Portuguese summary) --
+    # never ONLY free text, so a future audit can programmatically inspect
+    # exactly what diverged, not just read a paragraph.
+    mismatches_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class FundingEvent(Base):
+    """Correção v1.1 #6: one row per funding settlement, deduplicated by
+    the exchange's own identifier -- see app.execution.funding."""
+
+    __tablename__ = "funding_events"
+    __table_args__ = (
+        UniqueConstraint("funding_id", name="uq_funding_event_funding_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    funding_id: Mapped[str] = mapped_column(String(128))
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    amount: Mapped[float] = mapped_column(Float)  # positive = credited, negative = debited
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class OperationalSession(Base):
@@ -228,6 +260,11 @@ class OperationalSession(Base):
     strategy_version: Mapped[str] = mapped_column(String(64))
     risk_config_json: Mapped[str] = mapped_column(Text)
     config_snapshot_json: Mapped[str] = mapped_column(Text)  # sanitized -- never contains secrets
+    # Correção v1.1 #8: SHA-256 of the sanitized config snapshot + strategy
+    # version + risk config (never a secret, since it's derived from
+    # already-sanitized fields). A resumed session must match this exactly
+    # -- see app.sessions.start_or_resume_session.
+    config_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="INICIALIZANDO")
     candles_count: Mapped[int] = mapped_column(Integer, default=0)
     signals_count: Mapped[int] = mapped_column(Integer, default=0)

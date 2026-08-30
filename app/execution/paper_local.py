@@ -4,10 +4,11 @@ full pipeline without any exchange dependency.
 """
 from __future__ import annotations
 
+import itertools
 from typing import Callable
 
 from app.core.logging import get_logger, log_event
-from app.execution.base import CancelResult, FillResult
+from app.execution.base import FillEvent, OrderStatusSnapshot, SubmitAck
 from app.execution.order_state import OrderStatus
 from app.risk.engine import ApprovedOrder
 
@@ -29,20 +30,27 @@ class PaperLocalExecutionEngine:
         normal operation price_provider is never actually consulted; it
         exists so ad-hoc/test callers don't have to supply a price for every
         call. partial_fill_ratio, if set (0 < r < 1), simulates a partial
-        fill for every order -- used by tests to exercise that path."""
+        fill for every order -- used by tests to exercise that path.
+
+        Correção v1.1 #1: `submit()` no longer applies its own idempotency
+        guard by trusting a bare in-memory dict as the source of truth --
+        that's now the caller's job (the orchestrator never calls submit()
+        for an idempotency_key that already has a persisted Order). The
+        internal bookkeeping below exists only to let `poll_order()` serve
+        whatever `submit()` already computed for a given exchange_order_id
+        -- a lookup cache, not a correctness guard."""
         self._price_provider = price_provider
         self.fee_rate = fee_rate
         self.slippage_bps = slippage_bps
         self.partial_fill_ratio = partial_fill_ratio
-        self._seen_keys: dict[str, FillResult] = {}
+        self._snapshots: dict[str, OrderStatusSnapshot] = {}
         self._positions: dict[str, dict] = {}
+        self._fill_id_seq = itertools.count(1)
 
     def submit(
         self, order: ApprovedOrder, idempotency_key: str, reference_price: float | None = None
-    ) -> FillResult:
-        if idempotency_key in self._seen_keys:
-            log_event(logger, 30, "duplicate_order_suppressed", idempotency_key=idempotency_key)
-            return self._seen_keys[idempotency_key]
+    ) -> SubmitAck:
+        exchange_order_id = f"PAPER-{idempotency_key[:16]}"
 
         price = reference_price if reference_price is not None else self._price_provider(order.symbol)
         slip = price * (self.slippage_bps / 10_000.0)
@@ -52,20 +60,47 @@ class PaperLocalExecutionEngine:
         fill_qty = order.qty * self.partial_fill_ratio if is_partial else order.qty
         fee = fill_qty * fill_price * self.fee_rate
 
-        result = FillResult(
-            exchange_order_id=f"PAPER-{idempotency_key[:16]}",
-            fill_qty=fill_qty,
-            fill_price=fill_price,
-            fee=fee,
-            is_partial=is_partial,
-            status=OrderStatus.PARTIALLY_FILLED if is_partial else OrderStatus.FILLED,
+        fill = FillEvent(
+            exchange_fill_id=f"PAPER-FILL-{next(self._fill_id_seq)}",
+            fill_qty=fill_qty, fill_price=fill_price, fee=fee,
         )
-        self._seen_keys[idempotency_key] = result
-        self._apply_to_position(order, result)
-        return result
+        status = OrderStatus.PARTIALLY_FILLED if is_partial else OrderStatus.FILLED
+        self._snapshots[exchange_order_id] = OrderStatusSnapshot(
+            exchange_order_id=exchange_order_id, status=status, fills=[fill],
+        )
+        self._apply_to_position(order, fill_qty, fill_price)
+        return SubmitAck(exchange_order_id=exchange_order_id, status=OrderStatus.SUBMITTED)
 
-    def _apply_to_position(self, order: ApprovedOrder, result: FillResult) -> None:
-        """Four cases (Fase 1 correction 9):
+    def poll_order(self, exchange_order_id: str) -> OrderStatusSnapshot:
+        """PAPER fills are computed synchronously inside submit() -- polling
+        just serves whatever was already computed, every time (the fill
+        ledger, not this engine, is responsible for not double-applying an
+        already-recorded `exchange_fill_id`)."""
+        snapshot = self._snapshots.get(exchange_order_id)
+        if snapshot is None:
+            return OrderStatusSnapshot(exchange_order_id=exchange_order_id, status=OrderStatus.UNKNOWN, fills=[])
+        return snapshot
+
+    def request_cancel(self, exchange_order_id: str) -> None:
+        """Correção v1.1 #1: PAPER_LOCAL/PAPER_LIVE orders fill instantly
+        and synchronously inside submit() -- there is never a non-terminal
+        window in which a cancel request could arrive. Documented no-op;
+        the subsequent poll_order() call will report whatever terminal
+        fill state was already computed, never a fabricated CANCELLED."""
+        log_event(logger, 20, "paper_cancel_requested_on_already_terminal_order",
+                  exchange_order_id=exchange_order_id)
+
+    def list_open_orders(self, symbol: str) -> list[dict]:
+        """PAPER orders are never left open -- submit() always resolves
+        them (FILLED/PARTIALLY_FILLED) synchronously, so there is never an
+        order the 'exchange' (this simulator) considers open."""
+        return []
+
+    def _apply_to_position(self, order: ApprovedOrder, fill_qty: float, fill_price: float) -> None:
+        """Four cases (Fase 1 correction 9) -- this is the engine's OWN
+        simulated exchange-side position book (what get_position() reports
+        for reconciliation), independent of the DB-persisted Position table
+        the orchestrator/fill_service maintain.
         1. No existing position -> opens a new one.
         2. Existing position, same side -> increases qty, recomputes the
            weighted average entry price.
@@ -80,52 +115,28 @@ class PaperLocalExecutionEngine:
 
         if pos is None:
             self._positions[order.symbol] = {
-                "symbol": order.symbol,
-                "side": order.side,
-                "qty": result.fill_qty,
-                "avg_entry_price": result.fill_price,
+                "symbol": order.symbol, "side": order.side, "qty": fill_qty, "avg_entry_price": fill_price,
             }
             return
 
         if pos["side"] == order.side:
-            total_qty = pos["qty"] + result.fill_qty
-            pos["avg_entry_price"] = (
-                pos["avg_entry_price"] * pos["qty"] + result.fill_price * result.fill_qty
-            ) / total_qty
+            total_qty = pos["qty"] + fill_qty
+            pos["avg_entry_price"] = (pos["avg_entry_price"] * pos["qty"] + fill_price * fill_qty) / total_qty
             pos["qty"] = total_qty
             return
 
-        if result.fill_qty < pos["qty"] - 1e-12:
-            pos["qty"] -= result.fill_qty
+        if fill_qty < pos["qty"] - 1e-12:
+            pos["qty"] -= fill_qty
             return
 
-        if abs(result.fill_qty - pos["qty"]) <= 1e-12:
+        if abs(fill_qty - pos["qty"]) <= 1e-12:
             del self._positions[order.symbol]
             return
 
-        excess_qty = result.fill_qty - pos["qty"]
+        excess_qty = fill_qty - pos["qty"]
         self._positions[order.symbol] = {
-            "symbol": order.symbol,
-            "side": order.side,
-            "qty": excess_qty,
-            "avg_entry_price": result.fill_price,
+            "symbol": order.symbol, "side": order.side, "qty": excess_qty, "avg_entry_price": fill_price,
         }
 
     def get_position(self, symbol: str) -> dict | None:
         return self._positions.get(symbol)
-
-    def cancel(self, exchange_order_id: str) -> CancelResult:
-        """Fase 2, item 7.3: PAPER_LOCAL/PAPER_LIVE orders fill instantly and
-        synchronously inside submit() -- there is never a non-terminal
-        window in which a cancel request could arrive. Any order this
-        engine has ever seen is already FILLED/PARTIALLY_FILLED by the time
-        cancel() could be called, so this is a documented no-op that
-        reports whatever terminal fill state was already recorded, never a
-        fabricated CANCELLED."""
-        for result in self._seen_keys.values():
-            if result.exchange_order_id == exchange_order_id:
-                return CancelResult(
-                    exchange_order_id=exchange_order_id, status=result.status,
-                    filled_qty=result.fill_qty, avg_fill_price=result.fill_price, fee=result.fee,
-                )
-        return CancelResult(exchange_order_id=exchange_order_id, status=OrderStatus.UNKNOWN)

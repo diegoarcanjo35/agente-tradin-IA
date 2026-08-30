@@ -4,8 +4,15 @@ client built from pybit against a host that already passed
 app.core.config.assert_demo_host, while tests use tests/fakes/bybit_fake.py
 with zero network access.
 
-An HTTP 200 is never treated as "executed" -- submit() always follows up with
-a status confirmation call before returning a FILLED/PARTIALLY_FILLED result.
+Correção v1.1 #1: `submit()` no longer blocks waiting for confirmation --
+it does ONLY the create call and returns SUBMITTED/REJECTED/UNKNOWN
+immediately. An HTTP 200 on create is still never treated as "executed":
+confirmation of any fill always comes from a separate, later `poll_order()`
+call (invoked once immediately by the orchestrator, and again periodically
+for any order still non-terminal -- see Orchestrator._poll_open_orders).
+This engine itself no longer loops/retries internally; the periodic poller
+IS the retry mechanism, which is also what makes "process restarted with an
+order in flight" a real, recoverable case instead of a blocking wait.
 """
 from __future__ import annotations
 
@@ -15,11 +22,23 @@ from typing import Callable
 from app.core.config import assert_demo_host
 from app.core.errors import ExchangeTimeoutError, RateLimitError
 from app.core.logging import get_logger, log_event
-from app.execution.base import CancelResult, FillResult
+from app.execution.base import FillEvent, OrderStatusSnapshot, SubmitAck
 from app.execution.order_state import OrderStatus
 from app.risk.engine import ApprovedOrder
 
 logger = get_logger(__name__)
+
+# Bybit's real `orderStatus` values -> our OrderStatus. "New" (accepted, not
+# yet filled) maps to SUBMITTED; anything not recognized maps to UNKNOWN
+# rather than guessing.
+_BYBIT_STATUS_MAP = {
+    "New": OrderStatus.SUBMITTED,
+    "PartiallyFilled": OrderStatus.PARTIALLY_FILLED,
+    "Filled": OrderStatus.FILLED,
+    "Cancelled": OrderStatus.CANCELLED,
+    "PartiallyFilledCanceled": OrderStatus.CANCELLED,
+    "Rejected": OrderStatus.REJECTED,
+}
 
 
 class BybitDemoExecutionEngine:
@@ -28,28 +47,22 @@ class BybitDemoExecutionEngine:
         base_url: str,
         http_post: Callable[[str, dict], dict],
         http_get: Callable[[str, dict], dict],
-        max_status_polls: int = 5,
-        poll_interval_seconds: float = 0.5,
         sleep: Callable[[float], None] = time.sleep,
     ):
         assert_demo_host(base_url)
         self.base_url = base_url
         self._http_post = http_post
         self._http_get = http_get
-        self.max_status_polls = max_status_polls
-        self.poll_interval_seconds = poll_interval_seconds
         self._sleep = sleep
-        self._seen_keys: dict[str, FillResult] = {}
 
     def submit(
         self, order: ApprovedOrder, idempotency_key: str, reference_price: float | None = None
-    ) -> FillResult:
+    ) -> SubmitAck:
         # reference_price is intentionally unused: BYBIT_DEMO always fills at
         # whatever price the exchange actually reports, never a local guess.
-        if idempotency_key in self._seen_keys:
-            log_event(logger, 30, "duplicate_order_suppressed", idempotency_key=idempotency_key)
-            return self._seen_keys[idempotency_key]
-
+        # No idempotency cache here -- the caller (Orchestrator) never calls
+        # submit() for an idempotency_key that already has a persisted
+        # Order; the exchange's own orderLinkId dedup is a second layer.
         try:
             create_resp = self._http_post(
                 f"{self.base_url}/v5/order/create",
@@ -65,70 +78,64 @@ class BybitDemoExecutionEngine:
                     "orderLinkId": idempotency_key,
                 },
             )
-        except ExchangeTimeoutError as exc:
-            log_event(logger, 40, "order_submit_timeout", error=str(exc))
-            result = FillResult("", 0.0, 0.0, 0.0, False, OrderStatus.UNKNOWN)
-            return result
-        except RateLimitError as exc:
-            log_event(logger, 40, "order_submit_rate_limited", error=str(exc))
-            result = FillResult("", 0.0, 0.0, 0.0, False, OrderStatus.UNKNOWN)
-            return result
+        except (ExchangeTimeoutError, RateLimitError) as exc:
+            log_event(logger, 40, "order_submit_failed", error=str(exc))
+            return SubmitAck(exchange_order_id="", status=OrderStatus.UNKNOWN)
 
         exchange_order_id = create_resp.get("result", {}).get("orderId")
         if not exchange_order_id:
-            result = FillResult("", 0.0, 0.0, 0.0, False, OrderStatus.REJECTED)
-            self._seen_keys[idempotency_key] = result
-            return result
+            return SubmitAck(exchange_order_id="", status=OrderStatus.REJECTED)
+        return SubmitAck(exchange_order_id=exchange_order_id, status=OrderStatus.SUBMITTED)
 
-        # Never trust the create response alone: confirm via order status.
-        result = self._confirm_status(order, exchange_order_id, idempotency_key)
-        self._seen_keys[idempotency_key] = result
-        return result
+    def poll_order(self, exchange_order_id: str) -> OrderStatusSnapshot:
+        """ONE status query + (only if a fill is possible) ONE execution-
+        list query -- no internal retry loop. Returns the FULL list of
+        fills the exchange currently reports; the fill ledger
+        (app/execution/fill_ledger.py) is what deduplicates against
+        already-persisted `exchange_fill_id`s, so re-polling the same
+        order repeatedly is always safe."""
+        try:
+            status_resp = self._http_get(
+                f"{self.base_url}/v5/order/realtime",
+                {"category": "linear", "orderId": exchange_order_id},
+            )
+        except (ExchangeTimeoutError, RateLimitError) as exc:
+            log_event(logger, 30, "order_status_poll_failed", error=str(exc))
+            return OrderStatusSnapshot(exchange_order_id=exchange_order_id, status=OrderStatus.UNKNOWN, fills=[])
 
-    def _confirm_status(self, order: ApprovedOrder, exchange_order_id: str, idempotency_key: str) -> FillResult:
-        for attempt in range(self.max_status_polls):
-            if attempt > 0:
-                self._sleep(self.poll_interval_seconds)
+        rows = status_resp.get("result", {}).get("list", [])
+        if not rows:
+            return OrderStatusSnapshot(exchange_order_id=exchange_order_id, status=OrderStatus.UNKNOWN, fills=[])
+
+        raw_status = rows[0].get("orderStatus")
+        status = _BYBIT_STATUS_MAP.get(raw_status, OrderStatus.UNKNOWN)
+
+        fills: list[FillEvent] = []
+        if status in (OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED):
             try:
-                status_resp = self._http_get(
-                    f"{self.base_url}/v5/order/realtime",
+                exec_resp = self._http_get(
+                    f"{self.base_url}/v5/execution/list",
                     {"category": "linear", "orderId": exchange_order_id},
                 )
+                for row in exec_resp.get("result", {}).get("list", []):
+                    fills.append(FillEvent(
+                        exchange_fill_id=row["execId"],
+                        fill_qty=float(row.get("execQty", 0.0)),
+                        fill_price=float(row.get("execPrice", 0.0)),
+                        fee=float(row.get("execFee", 0.0)),
+                    ))
             except (ExchangeTimeoutError, RateLimitError) as exc:
-                log_event(logger, 30, "order_status_poll_failed", error=str(exc))
-                continue
+                # Status is still real and reportable; fill details are
+                # simply deferred to the next poll rather than blocking or
+                # fabricating them here.
+                log_event(logger, 30, "execution_list_poll_failed", error=str(exc))
 
-            rows = status_resp.get("result", {}).get("list", [])
-            if not rows:
-                continue
-            row = rows[0]
-            status = row.get("orderStatus")
-            if status in ("Filled", "PartiallyFilled"):
-                filled_qty = float(row.get("cumExecQty", 0.0))
-                avg_price = float(row.get("avgPrice", 0.0))
-                fee = float(row.get("cumExecFee", 0.0))
-                return FillResult(
-                    exchange_order_id=exchange_order_id,
-                    fill_qty=filled_qty,
-                    fill_price=avg_price,
-                    fee=fee,
-                    is_partial=(status == "PartiallyFilled"),
-                    status=OrderStatus.FILLED if status == "Filled" else OrderStatus.PARTIALLY_FILLED,
-                )
-            if status in ("Rejected", "Cancelled"):
-                return FillResult(exchange_order_id, 0.0, 0.0, 0.0, False, OrderStatus.REJECTED)
-        # Could not confirm after polling: leave unresolved for reconciliation,
-        # never claim FILLED without confirmation.
-        return FillResult(exchange_order_id, 0.0, 0.0, 0.0, False, OrderStatus.UNKNOWN)
+        return OrderStatusSnapshot(exchange_order_id=exchange_order_id, status=status, fills=fills)
 
-    def cancel(self, exchange_order_id: str) -> CancelResult:
-        """Fase 2, item 7.3: requests cancellation, then ALWAYS confirms the
-        real final state via the same status-polling loop as submit() --
-        never assumes CANCELLED just because the cancel request was
-        accepted. If a fill won the race before the cancel took effect,
-        this reports FILLED/PARTIALLY_FILLED (with the real fill data)
-        instead, so the caller persists that fill and adjusts the position
-        rather than incorrectly treating the order as cancelled."""
+    def request_cancel(self, exchange_order_id: str) -> None:
+        """Fire-and-forget (correção v1.1 #1): the caller persists
+        CANCEL_PENDING before calling this. Confirmation of the real
+        outcome always comes from a subsequent `poll_order()` call."""
         try:
             self._http_post(
                 f"{self.base_url}/v5/order/cancel",
@@ -136,39 +143,27 @@ class BybitDemoExecutionEngine:
             )
         except (ExchangeTimeoutError, RateLimitError) as exc:
             log_event(logger, 40, "order_cancel_request_failed", error=str(exc))
-            # Fall through to confirmation regardless -- the cancel may have
-            # been received by the exchange even if the response was lost.
+            # The cancel may still have been received by the exchange even
+            # if the response was lost -- the next poll_order() call is
+            # what actually determines the truth, never this method.
 
-        for attempt in range(self.max_status_polls):
-            if attempt > 0:
-                self._sleep(self.poll_interval_seconds)
-            try:
-                status_resp = self._http_get(
-                    f"{self.base_url}/v5/order/realtime",
-                    {"category": "linear", "orderId": exchange_order_id},
-                )
-            except (ExchangeTimeoutError, RateLimitError) as exc:
-                log_event(logger, 30, "order_cancel_status_poll_failed", error=str(exc))
-                continue
-
-            rows = status_resp.get("result", {}).get("list", [])
-            if not rows:
-                continue
-            row = rows[0]
-            status = row.get("orderStatus")
-            if status == "Cancelled":
-                return CancelResult(exchange_order_id=exchange_order_id, status=OrderStatus.CANCELLED)
-            if status in ("Filled", "PartiallyFilled"):
-                # Race lost to a fill -- report it truthfully, never a fake cancel.
-                return CancelResult(
-                    exchange_order_id=exchange_order_id,
-                    status=OrderStatus.FILLED if status == "Filled" else OrderStatus.PARTIALLY_FILLED,
-                    filled_qty=float(row.get("cumExecQty", 0.0)),
-                    avg_fill_price=float(row.get("avgPrice", 0.0)),
-                    fee=float(row.get("cumExecFee", 0.0)),
-                )
-        # Could not confirm the final state -- never claim CANCELLED without confirmation.
-        return CancelResult(exchange_order_id=exchange_order_id, status=OrderStatus.UNKNOWN)
+    def list_open_orders(self, symbol: str) -> list[dict]:
+        """Correção v1.1 #3: every order the exchange currently considers
+        open (New/PartiallyFilled) for `symbol` -- used by reconciliation
+        to detect an order the exchange has that isn't tracked locally."""
+        try:
+            resp = self._http_get(
+                f"{self.base_url}/v5/order/realtime", {"category": "linear", "symbol": symbol},
+            )
+        except (ExchangeTimeoutError, RateLimitError) as exc:
+            log_event(logger, 30, "list_open_orders_failed", error=str(exc))
+            return []
+        rows = resp.get("result", {}).get("list", [])
+        return [
+            {"exchange_order_id": row.get("orderId"), "side": row.get("side"), "qty": float(row.get("qty", 0.0))}
+            for row in rows
+            if row.get("orderStatus") in ("New", "PartiallyFilled")
+        ]
 
     def get_position(self, symbol: str) -> dict | None:
         resp = self._http_get(

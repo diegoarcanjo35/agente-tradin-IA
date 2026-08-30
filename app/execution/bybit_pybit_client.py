@@ -93,6 +93,16 @@ class PybitTransport:
             return self._call(self._client.get_order_history, **params)
         if url.endswith("/v5/position/list"):
             return self._call(self._client.get_positions, **params)
+        if url.endswith("/v5/execution/list"):
+            # Correção v1.1 #1/#2: individual fills (execId, execQty,
+            # execPrice, execFee) -- what the persistent fill ledger
+            # dedupes against, never the cumulative totals alone.
+            return self._call(self._client.get_executions, **params)
+        if url.endswith("/v5/account/transaction-log"):
+            # Correção v1.1 #6: individual funding settlements (SETTLEMENT
+            # transaction-log rows) -- what app.execution.funding dedupes
+            # against, never a simulated/fabricated value.
+            return self._call(self._client.get_transaction_log, **params)
         raise NotImplementedError(f"No pybit GET mapping for {url}")
 
     def http_post(self, url: str, payload: dict) -> dict:

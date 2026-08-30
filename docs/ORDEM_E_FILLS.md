@@ -1,9 +1,16 @@
 # Máquina de Estados de Ordens e Fills
 
-Fase 2, item 7.2. Antes desta fase, `orders.status` era uma string livre
+Fase 2, item 7.2. Antes da Fase 2, `orders.status` era uma string livre
 (`String(16)`), gravada uma única vez como `"PENDING"` em `repo.save_order`
 e nunca mais alterada em nenhum lugar do código — não havia máquina de
 estados de fato.
+
+**Correção da Fase 2 v1.1** reescreveu o ciclo real de vida da ordem: o
+fluxo v1.0 pulava direto de `PENDING_SUBMIT` para o estado terminal, sem
+nunca persistir `SUBMITTED`/`CANCEL_PENDING` de fato, sem acompanhamento
+persistente pós-`submit()`, e com fills aplicados por sobrescrita cumulativa
+em vez de por delta idempotente. O que está documentado abaixo é o desenho
+corrigido.
 
 ## Estados
 
@@ -18,11 +25,12 @@ estados de fato.
 - `CANCEL_PENDING` — cancelamento solicitado, ainda não confirmado.
 - `CANCELLED` — cancelamento confirmado pela corretora (terminal).
 - `REJECTED` — rejeitada pela corretora (terminal).
-- `UNKNOWN` — não foi possível confirmar o estado real após todas as
-  tentativas de polling. **Nenhuma ordem `UNKNOWN` libera nova exposição** —
-  `SystemState.order_state_unknown` é recalculado a cada transição
-  (`repo.has_unknown_orders`) e entra em `recompute_trading_blocked` como
-  causa independente de bloqueio.
+- `UNKNOWN` — não foi possível confirmar o estado real (ex.: uma resposta de
+  `poll_order()` fora de ordem que não corresponde a nenhuma transição
+  válida a partir do estado atual). **Nenhuma ordem `UNKNOWN` libera nova
+  exposição** — `SystemState.order_state_unknown` é recalculado a cada
+  transição (`repo.has_unknown_orders`) e entra em
+  `recompute_trading_blocked` como causa independente de bloqueio.
 
 `FILLED`, `CANCELLED` e `REJECTED` são terminais — nenhuma transição sai
 deles. Todas as demais transições permitidas estão explicitadas na tabela
@@ -38,59 +46,99 @@ valida a transição, grava uma linha de auditoria em `order_events`
 campo. Nenhum outro código (orchestrator, endpoints) escreve
 `order.status = ...` diretamente.
 
-`repo.record_fill(session, order, new_status, cumulative_filled_qty,
-avg_fill_price, fees_total, detail=None)` é usado especificamente para
-`PARTIALLY_FILLED`/`FILLED`: grava a transição (via
-`transition_order_status`) e atualiza `filled_qty`/`avg_fill_price`/
-`fees_total` com **semântica de conjunto** (SET), nunca soma — os mesmos
-valores que a Bybit já reporta como acumulados (`cumExecQty`, `avgPrice`,
-`cumExecFee`). Isso torna seguro registrar um segundo fill parcial, ou a
-confirmação final, sem nunca contar quantidade/taxa em dobro. Chamar
-`record_fill` de novo com o **mesmo** status terminal já registrado é
-corretamente rejeitado (`FILLED -> FILLED` não está na tabela de
-transições) — quem faz polling de status deve checar
-`is_terminal(order.status)` antes de tentar de novo.
+## Submissão separada de acompanhamento (correção v1.1 #1)
 
-## Cancelamento (item 7.3)
+`ExecutionEngine` (`app/execution/base.py`) não tem mais um `submit()`
+bloqueante que só retorna depois de confirmar o resultado. O contrato agora
+é:
 
-`ExecutionEngine.cancel(exchange_order_id) -> CancelResult`:
+- `submit(order, idempotency_key, reference_price) -> SubmitAck` — envia o
+  `POST /order/create` **uma única vez** e retorna imediatamente com
+  `exchange_order_id` + `status` (`SUBMITTED`, `REJECTED` ou `UNKNOWN`).
+  Nunca confirma fill.
+- `poll_order(exchange_order_id) -> OrderStatusSnapshot` — consulta o status
+  atual **e** o histórico completo de fills individuais (nunca um delta —
+  a deduplicação é responsabilidade de quem persiste, não de quem consulta).
+  É a única forma de saber que algo foi preenchido.
+- `request_cancel(exchange_order_id) -> None` — dispara o pedido de
+  cancelamento (fire-and-forget); o chamador **sempre** persiste
+  `CANCEL_PENDING` antes de chamar isso. A confirmação real (cancelado, ou
+  um fill que venceu a corrida) só vem de um `poll_order()` posterior.
+- `list_open_orders(symbol) -> list[dict]` — toda ordem que a corretora
+  considera aberta para `symbol`, usado pela reconciliação (ver
+  `docs/FASE_2.md`) para detectar uma ordem remota sem registro local.
 
-- `PaperLocalExecutionEngine.cancel()`: ordens locais preenchem
-  sincronamente dentro de `submit()` — nunca existe uma janela não-terminal
-  para cancelar. É um no-op documentado que devolve o estado terminal já
-  registrado (nunca fabrica um `CANCELLED`).
-- `BybitDemoExecutionEngine.cancel()`: `POST /v5/order/cancel`, depois
-  **sempre** confirma o estado final via o mesmo padrão de polling de
-  `submit()` — nunca assume `CANCELLED` sem confirmar. Se um fill venceu a
-  corrida antes do cancelamento ser processado, devolve
-  `FILLED`/`PARTIALLY_FILLED` com os dados reais do fill, para o chamador
-  registrar corretamente em vez de assumir cancelamento.
+`Orchestrator._submit_and_track` (usado por `_submit_and_record` e
+`_close_position_via_risk`) sempre chama `poll_order()` **uma vez,
+imediatamente**, logo após um `submit()` que retornou `SUBMITTED` — isso
+preserva o comportamento de preenchimento-no-mesmo-tick que os motores
+`PAPER_*` (síncronos) sempre tiveram. Além disso,
+`Orchestrator._maybe_poll_open_orders` roda no topo de todo `tick()`,
+gated por `OPEN_ORDER_POLL_INTERVAL_SECONDS`, e reconsulta **toda** ordem
+ainda não-terminal — inclusive uma que ficou pendente entre um reinício do
+processo e o próximo tick. Nenhuma ordem é reenviada: a deduplicação por
+`idempotency_key` (`repo.find_order_by_idempotency_key`, checada **antes**
+de qualquer `submit()`) é o que impede um envio duplicado, nunca um
+dicionário em memória dentro do motor.
 
-O kill switch (`POST /api/kill-switch/engage`) cancela toda ordem não
-terminal (`repo.non_terminal_orders`) que já tenha `exchange_order_id`
-antes de considerar o sistema estabilizado; se algo permanecer não-terminal
-ou uma corrida de fill for detectada, `Orchestrator.reconcile()` roda em
-seguida para assentar qualquer divergência de posição.
+## Fills: ledger idempotente por delta (correção v1.1 #2)
+
+`app/execution/fill_ledger.py::record_new_fills(session, order, fills)` é o
+único lugar que persiste `Execution` rows: deduplica por
+`exchange_fill_id` (índice único `(order_id, exchange_fill_id)`, migração
+v4) e, para cada fill novo, insere a linha e **recalcula**
+`order.filled_qty`/`avg_fill_price`/`fees_total` a partir do conjunto
+completo de `Execution` já gravadas — nunca soma ad hoc, nunca sobrescreve
+com um total cumulativo que a corretora reportou. Como `poll_order()`
+sempre devolve o histórico completo de fills (nunca um delta), chamar
+`record_new_fills` de novo com os mesmos fills (ou um superconjunto) é
+sempre um no-op seguro para o que já foi registrado.
+
+`app/execution/fill_service.py::apply_order_snapshot(...)` é o **único**
+ponto que aplica um `OrderStatusSnapshot` de ponta a ponta: transiciona o
+status (se mudou), grava os fills novos via o ledger, aplica o delta de
+cada fill à posição (abre/soma para entrada; reduz/fecha com PnL realizado
+para saída), atualiza `SystemState.order_state_unknown` e recomputa
+`trading_blocked`. É usado por **todos** os quatro caminhos que podem
+aprender sobre um fill: o poll imediato pós-submit, o poller periódico, o
+kill switch (`POST /api/kill-switch/engage`, que persiste `CANCEL_PENDING`
+antes de `request_cancel()`) e a reconciliação (`Orchestrator.reconcile()`,
+ver `docs/FASE_2.md`) — nunca existe um segundo caminho que toque
+`Execution`/`Position`/contadores de sessão de outra forma.
+
+## Política de fill parcial (correção v1.1 #2/#5)
+
+`PARTIAL_FILL_POLICY` (`WAIT` | `CANCEL_REMAINDER` | `EXPIRE_AND_CANCEL`) e
+`PARTIAL_FILL_TIMEOUT_SECONDS` controlam o que acontece com uma ordem presa
+em `PARTIALLY_FILLED` por tempo demais:
+
+- `WAIT` (padrão) nunca expira — sempre seguro.
+- `CANCEL_REMAINDER`/`EXPIRE_AND_CANCEL` transicionam para
+  `CANCEL_PENDING`, chamam `request_cancel()` e aplicam o resultado via
+  `fill_service` — o mesmo caminho de cancelamento usado em todo o resto do
+  sistema, nunca um atalho paralelo.
 
 ## Reinício com ordem em voo
 
-Como `ExecutionEngine.submit()` é uma chamada bloqueante que só retorna
-depois de tentar confirmar o resultado, hoje não existe uma janela real de
-"aceita mas ainda não confirmada" que sobreviva a um crash do processo —
-`_apply_fill_to_order` sempre transiciona a ordem para seu estado final
-antes de `tick()` retornar. Um crash **entre** `repo.save_order` (que cria
-a linha em `PENDING_SUBMIT`) e a chamada a `submit()` é a única janela
-real; nesse caso a ordem fica presa em `PENDING_SUBMIT` sem
-`exchange_order_id`, e a reconciliação periódica/no próximo tick é o
-mecanismo que resolve isso — não há reenvio automático da mesma ordem, e a
-deduplicação por `idempotency_key` (`find_order_by_idempotency_key`) impede
-qualquer novo envio duplicado para o mesmo sinal/candle.
+Toda ordem não-terminal (`SUBMITTED`, `PARTIALLY_FILLED`, `CANCEL_PENDING`,
+`UNKNOWN`) com `exchange_order_id` já persistido é retomada pelo poller
+periódico logo no primeiro `tick()` após o reinício — nunca reenviada. Um
+crash entre `repo.save_order` (que cria a linha em `PENDING_SUBMIT`, sem
+`exchange_order_id` ainda) e o retorno de `submit()` é a única janela onde a
+ordem fica sem rastro no lado da corretora; a deduplicação por
+`idempotency_key` garante que o próximo tick nunca a reenvie, e a
+reconciliação (que também consulta `list_open_orders()`) é o mecanismo que
+eventualmente resolve a ambiguidade.
 
 ## Testes
 
 `tests/test_order_state_machine.py` (transições válidas/inválidas),
-`tests/test_order_lifecycle_repo.py` (transição + fill idempotente),
-`tests/test_order_cancellation.py` (cancelamento, corrida de fill),
-`tests/test_reconciliation_periodic_and_order_lifecycle.py` (fiação real via
-`Orchestrator`, ordem `UNKNOWN` bloqueando entradas, kill switch cancelando
-pendências).
+`tests/test_order_lifecycle_repo.py` (ledger de fills por delta,
+idempotência), `tests/test_order_lifecycle_real_flow.py` (fluxo real
+completo: SUBMITTED → fills parciais por delta → CANCEL_PENDING →
+CANCELLED, reinício sem reenvio, `POST /order/create` uma única vez),
+`tests/test_order_cancellation.py` (`request_cancel`/`poll_order`,
+`list_open_orders`), `tests/test_partial_fill_policy.py` (WAIT/
+CANCEL_REMAINDER/EXPIRE_AND_CANCEL), `tests/test_reconciliation_periodic_and_order_lifecycle.py`
+(fiação real via `Orchestrator`, ordem `UNKNOWN` bloqueando entradas, kill
+switch cancelando pendências pelo caminho centralizado).

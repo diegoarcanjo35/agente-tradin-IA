@@ -15,9 +15,15 @@ motor. Um auditor pode reproduzir os mesmos números manualmente.
 - **Lucro bruto** = soma dos `realized_pnl` positivos.
 - **Prejuízo bruto** = soma dos `realized_pnl` negativos (valor negativo).
 - **Comissões** = soma de `fees_paid` de todas as operações fechadas.
-- **Lucro líquido** = lucro bruto + prejuízo bruto − comissões.
-- **Funding** = `"indisponível"` nesta fase (feed de funding da Bybit não
-  integrado no Fase 1).
+- **Lucro líquido** = lucro bruto + prejuízo bruto − comissões + funding
+  (0.0 quando funding é `"indisponível"` — nunca deixa o lucro líquido
+  indisponível só por causa disso).
+- **Funding** (correção v1.1 #6) = soma real de `funding_events` do período
+  (`repo.funding_total`), **só quando há um `funding_provider` configurado**
+  (exclusivamente `BYBIT_DEMO` — ver abaixo). `0.0` é um total genuíno
+  quando o provider existe mas nada foi coletado ainda; `"indisponível"`
+  é reservado para quando não há provider algum (`REPLAY`/`PAPER_LOCAL`/
+  `PAPER_LIVE`) — os dois nunca são confundidos.
 - **Taxa de acerto** = nº de operações vencedoras / nº total de operações
   fechadas.
 - **Ganho médio** = lucro bruto / nº de operações vencedoras.
@@ -71,6 +77,26 @@ alimentada por `repo.filled_orders()` via `GET /api/costs`:
   ordens migradas de antes da Fase 2), `slippage_avg_usd`/`slippage_total_usd`
   retornam `"indisponível"` — nunca um zero fabricado. `unpriced_orders_count`
   reporta quantas ordens ficaram de fora desse cálculo.
+
+## Funding real (correção v1.1 #6)
+
+`app/execution/funding.py::BybitFundingProvider.list_funding(symbol, since)`
+consulta o extrato de transações da Bybit (`/v5/account/transaction-log`,
+`type=SETTLEMENT`) através do mesmo transporte injetável `(url, params) ->
+dict` usado em todo `app/execution`/`app/market_data` — testável com
+`tests/fakes/bybit_fake.py`, zero rede real. `record_new_funding_events`
+deduplica por `funding_id` (índice único, migração v4) — repetir o mesmo
+lançamento entre polls, ou após um reinício com uma janela `since`
+sobreposta, é sempre um no-op seguro.
+
+Coleta periódica via `Orchestrator._maybe_collect_funding`, gated por
+`FUNDING_POLL_INTERVAL_SECONDS`, **só quando `mode=BYBIT_DEMO`**
+(`app/api/main.py::build_orchestrator` só constrói um `BybitFundingProvider`
+nesse branch — o único com credenciais privadas). `PAPER_LIVE` reaproveita o
+mesmo transporte público de mercado, mas nunca ganha um `funding_provider`:
+funding ali permanece `"indisponível"` com razão explícita ("modo
+simulado, sem lançamentos reais de funding a coletar") — nunca simulado e
+misturado com dado real coletado.
 
 ## AI Shadow: concordância e contrafactual (Fase 2, item 7.10)
 

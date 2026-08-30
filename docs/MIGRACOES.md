@@ -20,8 +20,9 @@ obrigatório (`NOT NULL`), sem índice único em `candles`.
 | `1` | v0 → v1 (correção v1.1) | Adiciona `system_state.state_ambiguous`; recria a tabela `orders` adicionando `is_close` e tornando `stop_loss` opcional (ordens de fechamento não têm stop-loss). |
 | `2` | v1 → v2 (correção v1.2) | Adiciona `system_state.clock_out_of_sync`; remove duplicatas históricas em `candles` (mantendo o registro de menor `id` — o mais antigo inserido — como canônico) e cria o índice único `uq_candle_symbol_timeframe_open_time`. |
 | `3` | v2 → v3 (Fase 2 v1.0) | Adiciona `orders.filled_qty`/`avg_fill_price`/`fees_total`/`reference_price` (máquina de estados de ordens, ver `docs/ORDEM_E_FILLS.md`); cria as tabelas `order_events` e `operational_sessions` (ver `docs/SESSOES_OPERACIONAIS.md`); adiciona as novas causas independentes de bloqueio em `system_state` (`reconciliation_diverged`, `reconciliation_stale`, `order_state_unknown`, `initialization_not_reconciled`, `last_reconciliation_at`, `operational_state`, `active_session_id`); adiciona `order_id`/`session_id` opcionais em `failures_reconciliations`. |
+| `4` | v3 → v4 (correção Fase 2 v1.1) | Adiciona `executions.exchange_fill_id` + índice único `(order_id, exchange_fill_id)` (ledger de fills idempotente, ver `docs/ORDEM_E_FILLS.md`); adiciona `failures_reconciliations.mismatches_json` (resultado estruturado de reconciliação); adiciona `operational_sessions.config_fingerprint` (retomada sensível a mudança de configuração, ver `docs/SESSOES_OPERACIONAIS.md`); cria a tabela `funding_events` + índice único em `funding_id` (coleta idempotente de funding, ver `docs/METRICAS.md`). |
 
-`CURRENT_SCHEMA_VERSION = 3` (constante em `app/persistence/migrations.py`),
+`CURRENT_SCHEMA_VERSION = 4` (constante em `app/persistence/migrations.py`),
 sempre igual à versão da migration mais recente da lista `MIGRATIONS`.
 
 ## Quando as migrations rodam
@@ -73,6 +74,11 @@ qualquer instrução DML, e uma falha posterior reverte tudo de verdade.
 Prova adversarial reproduzindo o cenário exato do auditor (ALTER real,
 depois falha, checagem de esquema E dados completos antes/depois):
 `tests/test_migrations.py::test_alter_table_add_column_is_rolled_back_on_later_failure`.
+A mesma prova é repetida especificamente no limite v3→v4 (correção v1.1 #9),
+partindo de um banco v3 real e consistente (não um atalho v0→v4):
+`test_migration_v4_add_column_is_rolled_back_on_later_failure`,
+`test_migration_v4_upgrades_a_real_v3_database_preserving_data_and_is_idempotent`,
+`test_migration_v4_only_recorded_history_with_v4_invariants_missing_is_rejected`.
 
 ## Divergência de esquema (correções v1.4 #3 e v1.5 #2)
 
@@ -95,6 +101,13 @@ coluna sentinela) contra o esquema real:
   `reconciliation_stale`, `order_state_unknown`,
   `initialization_not_reconciled`, `last_reconciliation_at`,
   `operational_state`, `active_session_id`) existem.
+- **v4** (correção v1.1 #9): `executions.exchange_fill_id` existe **e**
+  existe um índice único cobrindo `(order_id, exchange_fill_id)` — checado
+  pela estrutura do índice, não só a coluna, porque é o índice (não a
+  coluna sozinha) que de fato impede duplicação de fill no nível do banco;
+  `failures_reconciliations.mismatches_json` existe;
+  `operational_sessions.config_fingerprint` existe; a tabela
+  `funding_events` existe **e** tem um índice único sobre `funding_id`.
 
 ### Cadeia ancestral completa, não só a versão mais alta (correção v1.5 #2)
 

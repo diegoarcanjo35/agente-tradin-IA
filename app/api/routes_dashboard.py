@@ -141,7 +141,13 @@ def get_metrics(request: Request):
         ]
         open_pos = repo.open_positions(session)
         open_exposure = sum(p.qty * p.avg_entry_price for p in open_pos)
-        result = compute_metrics(trades, starting_balance=1000.0, open_exposure_usd=open_exposure)
+        # Correção v1.1 #6: a real collected SUM only when a funding
+        # provider actually exists (BYBIT_DEMO) -- None otherwise, so
+        # UNAVAILABLE is never confused with "collected and it's 0.0".
+        funding = repo.funding_total(session, orch.settings.symbol) if orch.funding_provider is not None else None
+        result = compute_metrics(
+            trades, starting_balance=1000.0, open_exposure_usd=open_exposure, funding_total=funding,
+        )
         return result.__dict__
 
 

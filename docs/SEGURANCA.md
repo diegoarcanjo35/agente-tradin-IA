@@ -47,6 +47,15 @@ usuário como frase. Verificado por `tests/test_frontend_i18n.py`.
   recebe nem devolve uma referência a um `ExecutionEngine` ou `ApprovedOrder`.
 - Saída validada contra um schema Pydantic estrito (`AIRecommendationOutput`);
   timeout e tamanho máximo de resposta são configuráveis e aplicados sempre.
+- O provedor externo opcional (correção v1.1 #5, `app/ai_shadow/http_provider.py::HttpAIProvider`)
+  vive dentro do mesmo pacote `app/ai_shadow/` e está sujeito à mesma
+  varredura estrutural do `guard.py` — não pode importar `app.execution`/
+  `pybit` nem referenciar credenciais Bybit, exatamente como
+  `SimulatedProvider`. Desligado por padrão
+  (`AI_SHADOW_EXTERNAL_PROVIDER_ENABLED=false`); só é usado quando
+  explicitamente ligado **e** com `AI_PROVIDER_API_KEY`/
+  `AI_PROVIDER_ENDPOINT_URL` preenchidos — uma configuração incompleta
+  nunca tenta alcançar a rede, apenas mantém `SimulatedProvider`.
 
 ## Autoridade soberana do Risk Engine
 

@@ -4,6 +4,7 @@ graceful shutdown. Never mutated by anything outside this module.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from dataclasses import asdict
@@ -40,13 +41,34 @@ def _sanitized_config_snapshot(settings) -> dict:
     return snapshot
 
 
+def _config_fingerprint(settings, strategy_version: str, risk_limits: RiskLimits) -> str:
+    """Correção v1.1 #8: a deterministic SHA-256 over the exact same
+    sanitized (never-secret) fields already used for `config_snapshot_json`
+    -- strategy version, mode/symbol, timeframe, and every risk limit.
+    `json.dumps(sort_keys=True)` makes key order irrelevant, so this is
+    stable across process restarts regardless of dict construction order."""
+    payload = {
+        "strategy_version": strategy_version,
+        "timeframe": "1",
+        "risk_config": asdict(risk_limits),
+        "config_snapshot": _sanitized_config_snapshot(settings),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def start_or_resume_session(
     session: Session, settings, strategy_version: str, risk_limits: RiskLimits,
 ) -> OperationalSession:
     """Resumes the most recent NOT-ended session for this exact mode+symbol,
-    or creates a new one. Never resumes across modes/symbols -- a session is
-    meaningless if the process is now observing a different market or
-    running in a different mode than when it started."""
+    but ONLY if its persisted `config_fingerprint` matches the current
+    strategy version/mode/symbol/timeframe/risk config exactly (correção
+    v1.1 #8) -- a resumed session can no longer silently keep operating
+    under a stale snapshot after a config change. A mismatch ends the old
+    session (Portuguese reason) and starts a fresh one; a session with no
+    fingerprint at all (a pre-correção-v1.1 row) is treated as a mismatch
+    too, never trusted implicitly."""
+    fingerprint = _config_fingerprint(settings, strategy_version, risk_limits)
+
     existing = session.execute(
         select(OperationalSession)
         .where(
@@ -57,8 +79,15 @@ def start_or_resume_session(
         .order_by(OperationalSession.started_at.desc())
         .limit(1)
     ).scalar_one_or_none()
+
     if existing is not None:
-        return existing
+        if existing.config_fingerprint == fingerprint:
+            return existing
+        end_session(
+            session, existing,
+            "Configuração alterada (estratégia/risco/timeframe) -- sessão anterior encerrada, "
+            "nova sessão iniciada com o novo fingerprint.",
+        )
 
     op_session = OperationalSession(
         session_uid=str(uuid.uuid4()),
@@ -68,6 +97,7 @@ def start_or_resume_session(
         strategy_version=strategy_version,
         risk_config_json=json.dumps(asdict(risk_limits)),
         config_snapshot_json=json.dumps(_sanitized_config_snapshot(settings)),
+        config_fingerprint=fingerprint,
         status="INICIALIZANDO",
     )
     session.add(op_session)

@@ -126,14 +126,16 @@ def test_two_far_apart_candles_produce_two_different_correct_fill_prices(session
         symbol="BTCUSDT", side="BUY", qty=0.01, price=100.0,
         stop_loss=None, take_profit=None, signal_id=1,
     )
-    r1 = engine.submit(o1, make_idempotency_key(o1, "b1"), reference_price=100.0)
+    ack1 = engine.submit(o1, make_idempotency_key(o1, "b1"), reference_price=100.0)
+    fill1 = engine.poll_order(ack1.exchange_order_id).fills[0]
 
     o2 = approved_open_order(
         symbol="BTCUSDT", side="BUY", qty=0.01, price=50000.0,
         stop_loss=None, take_profit=None, signal_id=2,
     )
-    r2 = engine.submit(o2, make_idempotency_key(o2, "b2"), reference_price=50000.0)
+    ack2 = engine.submit(o2, make_idempotency_key(o2, "b2"), reference_price=50000.0)
+    fill2 = engine.poll_order(ack2.exchange_order_id).fills[0]
 
-    assert r1.fill_price == pytest.approx(100.0)
-    assert r2.fill_price == pytest.approx(50000.0)
-    assert r1.fill_price != r2.fill_price
+    assert fill1.fill_price == pytest.approx(100.0)
+    assert fill2.fill_price == pytest.approx(50000.0)
+    assert fill1.fill_price != fill2.fill_price

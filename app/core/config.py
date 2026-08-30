@@ -150,6 +150,42 @@ class Settings(BaseSettings):
     reconciliation_interval_seconds: float = Field(default=300.0)
     reconciliation_max_delay_seconds: float = Field(default=900.0)
 
+    # Correção v1.1 #1: real, persistent order-status polling -- how often
+    # Orchestrator._poll_open_orders re-queries every non-terminal order
+    # (independent of the ONE immediate poll that always follows a fresh
+    # submit()). This is what gives "acompanhamento persistente" real
+    # substance: an order that restarts the process while SUBMITTED /
+    # PARTIALLY_FILLED / CANCEL_PENDING / UNKNOWN is picked back up here,
+    # never re-submitted.
+    open_order_poll_interval_seconds: float = Field(default=5.0)
+
+    # Correção v1.1 #2/#5: policy for an order that has been sitting
+    # PARTIALLY_FILLED for longer than `partial_fill_timeout_seconds`.
+    # WAIT never times out (default -- always safe); CANCEL_REMAINDER and
+    # EXPIRE_AND_CANCEL both request cancellation of the unfilled remainder
+    # once the timeout elapses.
+    partial_fill_policy: str = Field(default="WAIT")
+    partial_fill_timeout_seconds: float = Field(default=300.0)
+
+    # Correção v1.1 #6: how often Orchestrator._maybe_collect_funding polls
+    # BYBIT_DEMO's transaction log for new funding settlements. Irrelevant
+    # (never even read) for REPLAY/PAPER_LOCAL/PAPER_LIVE, which are never
+    # paired with a funding_provider at all.
+    funding_poll_interval_seconds: float = Field(default=300.0)
+
+    # Correção v1.1 #5: PAPER_LIVE must mathematically prove its configured
+    # fee/slippage in every fill/metric it produces -- these were never
+    # wired at all before, so PaperLocalExecutionEngine silently fell back
+    # to its own hardcoded defaults regardless of what an operator set.
+    paper_live_fee_rate: float = Field(default=0.0006)
+    paper_live_slippage_bps: float = Field(default=5.0)
+
+    # Correção v1.1 #5: optional, default-OFF external AI Shadow provider.
+    # SimulatedProvider remains the production default in every case --
+    # this only takes effect when explicitly enabled AND an API key is
+    # configured (see app/api/main.py::build_orchestrator).
+    ai_shadow_external_provider_enabled: bool = Field(default=False)
+
     # Risk defaults (conservative). See app/risk/config.py for the dataclass
     # these seed and full documentation of each limit.
     risk_max_position_usd: float = Field(default=50.0)
@@ -164,6 +200,7 @@ class Settings(BaseSettings):
 
     ai_shadow_enabled_default: bool = Field(default=True)
     ai_provider_api_key: str = Field(default="")
+    ai_provider_endpoint_url: str = Field(default="")
     ai_timeout_seconds: float = Field(default=8.0)
     ai_max_response_chars: int = Field(default=4000)
 
@@ -186,6 +223,16 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8000)
     api_allow_external_bind: bool = Field(default=False)
     control_api_token: str = Field(default="")
+
+    @field_validator("partial_fill_policy")
+    @classmethod
+    def _validate_partial_fill_policy(cls, v: str) -> str:
+        allowed = {"WAIT", "CANCEL_REMAINDER", "EXPIRE_AND_CANCEL"}
+        if v not in allowed:
+            raise ValueError(
+                f"PARTIAL_FILL_POLICY inválida: {v!r}. Valores aceitos: {sorted(allowed)}."
+            )
+        return v
 
     @field_validator("bybit_base_url", "bybit_ws_url")
     @classmethod

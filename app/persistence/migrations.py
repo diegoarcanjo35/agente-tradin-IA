@@ -44,6 +44,11 @@ Schema history:
             last_reconciliation_at, operational_state, active_session_id),
             plus optional order_id/session_id links on
             failures_reconciliations.
+  v3 -> v4  (correção Fase 2 v1.1): adds executions.exchange_fill_id +
+            a unique index on (order_id, exchange_fill_id) -- the
+            persistent, idempotent fill ledger (app/execution/fill_ledger.py)
+            that replaced overwriting cumulative totals with per-fill,
+            delta-based application. See docs/ORDEM_E_FILLS.md.
 """
 from __future__ import annotations
 
@@ -56,7 +61,7 @@ from sqlalchemy.engine import Connection, Engine
 
 from app.persistence.models import Base
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 class MigrationError(Exception):
@@ -309,6 +314,42 @@ def _migrate_to_v3(conn: Connection) -> None:
             conn.execute(text(f"ALTER TABLE system_state ADD COLUMN {column} {ddl_type}"))
 
 
+def _migrate_to_v4(conn: Connection) -> None:
+    """Correção Fase 2 v1.1: ledger de fills idempotente + reconciliação
+    estruturada + funding + fingerprint de sessão."""
+    if not _column_exists(conn, "executions", "exchange_fill_id"):
+        conn.execute(text("ALTER TABLE executions ADD COLUMN exchange_fill_id VARCHAR(128)"))
+    if not _has_unique_index_on(conn, "executions", {"order_id", "exchange_fill_id"}):
+        conn.execute(text(
+            "CREATE UNIQUE INDEX uq_execution_order_exchange_fill_id "
+            "ON executions (order_id, exchange_fill_id)"
+        ))
+
+    if not _column_exists(conn, "failures_reconciliations", "mismatches_json"):
+        conn.execute(text("ALTER TABLE failures_reconciliations ADD COLUMN mismatches_json TEXT"))
+
+    if not _column_exists(conn, "operational_sessions", "config_fingerprint"):
+        conn.execute(text("ALTER TABLE operational_sessions ADD COLUMN config_fingerprint VARCHAR(64)"))
+
+    conn.execute(text(
+        "CREATE TABLE IF NOT EXISTS funding_events ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "funding_id VARCHAR(128) NOT NULL, "
+        "symbol VARCHAR(32) NOT NULL, "
+        "amount FLOAT NOT NULL, "
+        "occurred_at DATETIME NOT NULL, "
+        "created_at DATETIME NOT NULL"
+        ")"
+    ))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_funding_events_symbol ON funding_events (symbol)"
+    ))
+    if not _has_unique_index_on(conn, "funding_events", {"funding_id"}):
+        conn.execute(text(
+            "CREATE UNIQUE INDEX uq_funding_event_funding_id ON funding_events (funding_id)"
+        ))
+
+
 # Order matters: applied strictly in ascending version order.
 MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
     (1, "Adiciona system_state.state_ambiguous, orders.is_close; relaxa orders.stop_loss para opcional.", _migrate_to_v1),
@@ -316,6 +357,11 @@ MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
     (3, "Adiciona máquina de estados de ordens (filled_qty/avg_fill_price/fees_total, order_events), "
         "sessões operacionais (operational_sessions) e novas causas independentes de bloqueio em system_state.",
      _migrate_to_v3),
+    (4, "Adiciona executions.exchange_fill_id e índice único (order_id, exchange_fill_id) -- ledger de fills "
+        "idempotente; failures_reconciliations.mismatches_json -- resultado estruturado de reconciliação; "
+        "operational_sessions.config_fingerprint -- retomada de sessão sensível a mudança de configuração; "
+        "tabela funding_events -- coleta idempotente de funding.",
+     _migrate_to_v4),
 ]
 
 
@@ -361,10 +407,25 @@ def _v3_invariants_satisfied(conn: Connection) -> bool:
     )
 
 
+def _v4_invariants_satisfied(conn: Connection) -> bool:
+    """ALL structural invariants of v4 -- not just column presence: the
+    UNIQUE indexes (not just the columns) are what actually make duplicate
+    fill/funding application impossible at the database level."""
+    return (
+        _column_exists(conn, "executions", "exchange_fill_id")
+        and _has_unique_index_on(conn, "executions", {"order_id", "exchange_fill_id"})
+        and _column_exists(conn, "failures_reconciliations", "mismatches_json")
+        and _column_exists(conn, "operational_sessions", "config_fingerprint")
+        and _table_exists(conn, "funding_events")
+        and _has_unique_index_on(conn, "funding_events", {"funding_id"})
+    )
+
+
 _VERSION_INVARIANTS: dict[int, Callable[[Connection], bool]] = {
     1: _v1_invariants_satisfied,
     2: _v2_invariants_satisfied,
     3: _v3_invariants_satisfied,
+    4: _v4_invariants_satisfied,
 }
 
 

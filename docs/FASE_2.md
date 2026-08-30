@@ -19,9 +19,40 @@ recuperação, rastreabilidade e segurança operacional.
 | Controle de entradas | implícito (qualquer ordem aprovada era enviada) | separado em `operational_state` — ver abaixo |
 | Sessões | não existiam | `operational_sessions` — ver `docs/SESSOES_OPERACIONAIS.md` |
 | Modos | `REPLAY`, `PAPER_LOCAL`, `BYBIT_DEMO` | + `PAPER_LIVE` (dados reais, execução simulada) |
-| Cancelamento | não existia | `ExecutionEngine.cancel()`, kill switch cancela pendências |
+| Cancelamento | não existia | `ExecutionEngine.request_cancel()` + `poll_order()`, kill switch cancela pendências |
 | Custos | taxas, PnL bruto/líquido | + slippage realizado vs. preço de referência (`app/metrics/engine.py::compute_cost_metrics`) |
 | AI Shadow | contexto básico | + sessão/posição/risco/métricas no contexto; métricas de concordância (`app/metrics/ai_shadow_metrics.py`) |
+
+## Correção da Fase 2 v1.1
+
+A Fase 2 v1.0 foi reprovada em auditoria (commit `c00eb16`, base `d095780`,
+suíte confirmada `273 passed`) e corrigida em 9 pontos correlacionados. O
+desenho final está documentado em detalhe em `docs/ORDEM_E_FILLS.md`
+(correções 1/2/4), na seção "Reconciliação" abaixo (correção 3),
+`docs/SESSOES_OPERACIONAIS.md` (correções 7/8) e `docs/METRICAS.md`
+(correção 6). Resumo:
+
+1. **Ciclo real de ordens** — `submit()`/`poll_order()`/`request_cancel()`
+   separados; poller periódico persistente; nenhuma dependência de
+   dicionário em memória para deduplicação.
+2. **Fills por delta idempotentes** — ledger por `exchange_fill_id`,
+   política de fill parcial configurável.
+3. **Reconciliação profunda** — preço médio da posição, ordens abertas
+   desconhecidas/ausentes, resultado estruturado persistido.
+4. **Fill centralizado** — `apply_order_snapshot` é o único caminho que
+   aplica um fill, usado por submit, poller, kill switch e reconciliação.
+5. **Configurações que faltavam** — `PARTIAL_FILL_POLICY`,
+   `OPEN_ORDER_POLL_INTERVAL_SECONDS`, `PAPER_LIVE_FEE_RATE`/
+   `PAPER_LIVE_SLIPPAGE_BPS`, toggle externo do AI Shadow — todas
+   genuinamente conectadas (ver `.env.example`).
+6. **Funding real** — coleta real via `BybitFundingProvider` (só
+   BYBIT_DEMO); ver `docs/METRICAS.md`.
+7. **Desligamento gracioso** — `end_session()` passou a ser chamado de
+   fato no shutdown; ver `docs/SESSOES_OPERACIONAIS.md`.
+8. **Fingerprint de sessão** — retomada sensível a mudança de
+   estratégia/risco/timeframe; ver `docs/SESSOES_OPERACIONAIS.md`.
+9. **Migração v4** — invariantes estruturais mais profundas (nulidade,
+   unicidade); ver `docs/MIGRACOES.md`.
 
 ## Estado operacional (item 7.8)
 
@@ -57,27 +88,28 @@ INICIALIZANDO → OBSERVANDO → ATIVO (ação explícita do operador)
 
 Reaproveita `BybitDemoMarketDataProvider`/`BybitServerTimeProvider` (dados
 reais, só endpoints públicos, sem credenciais) pareado com
-`PaperLocalExecutionEngine` (execução 100% local). Nunca constrói
-`BybitDemoExecutionEngine`, nunca chama `require_bybit_credentials()`, nunca
-usa `http_post` — `PaperLocalExecutionEngine` simplesmente não tem nenhum
-caminho de código que envie uma requisição à corretora. Banner do painel:
-`"PAPER AO VIVO — SIMULAÇÃO, SEM ORDEM NA CORRETORA"`. Testado em
-`tests/test_paper_live_mode.py`.
+`PaperLocalExecutionEngine` (execução 100% local), configurado com
+`PAPER_LIVE_FEE_RATE`/`PAPER_LIVE_SLIPPAGE_BPS` (correção v1.1 #5) — todo
+fill simulado reflete matematicamente essa taxa/slippage configurada, nunca
+um default hardcoded silencioso. Nunca constrói `BybitDemoExecutionEngine`,
+nunca chama `require_bybit_credentials()`, nunca usa `http_post` —
+`PaperLocalExecutionEngine` simplesmente não tem nenhum caminho de código
+que envie uma requisição à corretora. Banner do painel: `"PAPER AO VIVO —
+SIMULAÇÃO, SEM ORDEM NA CORRETORA"`. Testado em `tests/test_paper_live_mode.py`
+e `tests/test_remaining_config_estagio_g.py`.
 
 ## Migração de esquema
 
-Nova versão `3` do sistema de migrações (`app/persistence/migrations.py`) —
-ver `docs/MIGRACOES.md`. Upgrade obrigatório e testado a partir do banco
-aprovado da Fase 1; histórico continua contíguo e validado
+Versão `4` do sistema de migrações (`app/persistence/migrations.py`) — ver
+`docs/MIGRACOES.md`. Upgrade obrigatório e testado a partir do banco
+aprovado da Fase 1 (v0→v4) e a partir de um banco v3 real e consistente
+(v3→v4, correção v1.1 #9); histórico continua contíguo e validado
 cumulativamente; nenhuma versão futura/desconhecida é aceita.
 
 ## Limitações desta fase
 
 - `PAPER_LIVE` usa os mesmos limites de risco configurados para os demais
   modos — não há um perfil de risco dedicado por modo nesta fase.
-- Funding real do Bybit Demo não está conectado (endpoint não wired ainda)
-  — `MetricsResult.funding` continua reportando `"indisponível"`, nunca um
-  zero fabricado.
 - O roteiro de teste manual (`docs/ROTEIRO_TESTE_MANUAL_DEMO.md`) é apenas
   documentação — não é executado automaticamente e exige autorização
   separada do Diego.

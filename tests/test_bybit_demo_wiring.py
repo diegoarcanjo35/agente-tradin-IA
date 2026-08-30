@@ -138,9 +138,12 @@ class _KlineSequenceTransport:
         order_id = resp.get("result", {}).get("orderId")
         if url.endswith("/v5/order/create") and order_id:
             last_close = self._rows[self._idx - 1][4] if self._idx > 0 else "100"
+            qty = payload.get("qty", "0")
             self._base.queue_status(order_id, [
-                {"orderStatus": "Filled", "cumExecQty": payload.get("qty", "0"),
-                 "avgPrice": last_close, "cumExecFee": "0.01"},
+                {"orderStatus": "Filled", "cumExecQty": qty, "avgPrice": last_close, "cumExecFee": "0.01"},
+            ])
+            self._base.queue_executions(order_id, [
+                {"execId": f"{order_id}-EXEC-1", "execQty": qty, "execPrice": last_close, "execFee": "0.01"},
             ])
         return resp
 

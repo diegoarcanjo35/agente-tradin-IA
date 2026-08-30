@@ -15,6 +15,7 @@ from app.persistence.migrations import (
     CURRENT_SCHEMA_VERSION,
     MigrationError,
     SchemaDivergenceError,
+    _has_unique_index_on,
     _table_exists,
     current_schema_version,
     run_migrations,
@@ -192,7 +193,7 @@ def test_upgrade_v0_to_current_preserves_all_data_and_adds_new_schema(tmp_path):
 
     assert report.starting_version == 0
     assert report.ending_version == CURRENT_SCHEMA_VERSION
-    assert report.applied == [1, 2, 3]
+    assert report.applied == [1, 2, 3, 4]
     assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
 
     # 1. New columns exist.
@@ -334,7 +335,7 @@ def test_v1_database_only_needs_migration_2(tmp_path):
 
     report = run_migrations(engine)
     assert report.starting_version == 1
-    assert report.applied == [2, 3]  # never re-runs migration 1's orders rebuild
+    assert report.applied == [2, 3, 4]  # never re-runs migration 1's orders rebuild
 
     with engine.connect() as conn:
         cols = {r[1] for r in conn.execute(text("PRAGMA table_info(system_state)")).fetchall()}
@@ -497,7 +498,7 @@ def test_clock_out_of_sync_present_but_unique_index_missing_is_detected_as_v1(tm
     assert current_schema_version(engine) == 0  # stop_loss still NOT NULL -> v1 itself isn't satisfied either
 
     report = run_migrations(engine)
-    assert report.applied == [1, 2, 3]
+    assert report.applied == [1, 2, 3, 4]
     with engine.connect() as conn:
         assert conn.execute(
             text("SELECT name FROM sqlite_master WHERE type='index' AND name='uq_candle_symbol_timeframe_open_time'")
@@ -516,7 +517,7 @@ def test_is_close_present_but_stop_loss_still_not_null_is_detected_as_v0(tmp_pat
     assert current_schema_version(engine) == 0
 
     report = run_migrations(engine)
-    assert report.applied == [1, 2, 3]
+    assert report.applied == [1, 2, 3, 4]
     with engine.connect() as conn:
         assert conn.execute(text(
             "INSERT INTO orders (idempotency_key, risk_evaluation_id, symbol, side, qty, stop_loss, "
@@ -544,7 +545,7 @@ def test_recorded_v2_with_missing_index_raises_schema_divergence_error(tmp_path)
     # No further schema/data change happened as a side effect of detecting this.
     with engine.connect() as conn:
         migration_rows = conn.execute(text("SELECT version FROM schema_migrations ORDER BY version")).fetchall()
-        assert [r[0] for r in migration_rows] == [1, 2, 3]  # unchanged from before the sabotage
+        assert [r[0] for r in migration_rows] == [1, 2, 3, 4]  # unchanged from before the sabotage
 
 
 def test_differently_named_unique_index_still_satisfies_the_invariant(tmp_path):
@@ -576,7 +577,7 @@ def test_differently_named_unique_index_still_satisfies_the_invariant(tmp_path):
     assert current_schema_version(engine) == 2
 
     report = run_migrations(engine)
-    assert report.applied == [3]  # already fully v2 (custom index name counts) -- only v3 is new, no divergence
+    assert report.applied == [3, 4]  # already fully v2 (custom index name counts) -- only v3+v4 are new, no divergence
 
 
 def test_fully_current_database_is_idempotent_under_strict_invariant_checking(tmp_path):
@@ -756,7 +757,7 @@ def test_partial_legacy_schema_with_no_history_migrates_and_validates_correctly(
 
     report = run_migrations(engine)
     assert report.starting_version == 0
-    assert report.applied == [1, 2, 3]
+    assert report.applied == [1, 2, 3, 4]
     assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
     with engine.connect() as conn:
         assert conn.execute(
@@ -855,3 +856,123 @@ def test_migration_v3_only_recorded_history_with_v3_invariants_missing_is_reject
         current_schema_version(engine)
     with pytest.raises(SchemaDivergenceError):
         run_migrations(engine)
+
+
+def _make_real_v3_engine(tmp_path, name="real_v3.db"):
+    """Correção v1.1 #9: a genuine, consistent v3 database (stopping
+    exactly at the previously-approved Fase 2 v1.0 schema, with real rows
+    in it) -- built by temporarily hiding migration 4 from `MIGRATIONS`
+    rather than hand-rolling a second copy of the v3 DDL, so this always
+    tracks whatever v3 actually is."""
+    import app.persistence.migrations as migrations_module
+
+    engine = _make_legacy_v0_engine(tmp_path, name=name)
+    real_migrations = list(migrations_module.MIGRATIONS)
+    only_through_v3 = [m for m in real_migrations if m[0] <= 3]
+    try:
+        migrations_module.__dict__["MIGRATIONS"] = only_through_v3
+        report = run_migrations(engine)
+    finally:
+        migrations_module.__dict__["MIGRATIONS"] = real_migrations
+    assert report.ending_version == 3
+    return engine
+
+
+def test_migration_v4_upgrades_a_real_v3_database_preserving_data_and_is_idempotent(tmp_path):
+    """Correção v1.1 #9: upgrading from an actual, previously-approved v3
+    database (not a v0-to-v4 shortcut) must preserve every row, add the
+    fills-ledger/reconciliation/session-fingerprint/funding structures, and
+    be a safe no-op on immediate re-run."""
+    engine = _make_real_v3_engine(tmp_path)
+    before_counts = _row_counts(engine)
+    assert current_schema_version(engine) == 3
+
+    report = run_migrations(engine)
+    assert report.starting_version == 3
+    assert report.applied == [4]
+    assert report.ending_version == CURRENT_SCHEMA_VERSION
+    assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
+
+    after_counts = _row_counts(engine)
+    for table, before in before_counts.items():
+        assert after_counts[table] == before, f"{table} lost rows during v4 migration"
+
+    with engine.connect() as conn:
+        exec_cols = {r[1] for r in conn.execute(text("PRAGMA table_info(executions)")).fetchall()}
+        assert "exchange_fill_id" in exec_cols
+        assert _has_unique_index_on(conn, "executions", {"order_id", "exchange_fill_id"})
+
+        fr_cols = {r[1] for r in conn.execute(text("PRAGMA table_info(failures_reconciliations)")).fetchall()}
+        assert "mismatches_json" in fr_cols
+
+        session_cols = {r[1] for r in conn.execute(text("PRAGMA table_info(operational_sessions)")).fetchall()}
+        assert "config_fingerprint" in session_cols
+
+        assert _table_exists(conn, "funding_events")
+        assert _has_unique_index_on(conn, "funding_events", {"funding_id"})
+
+        # New tables/columns are immediately usable.
+        conn.execute(text(
+            "INSERT INTO funding_events (funding_id, symbol, amount, occurred_at, created_at) "
+            "VALUES ('fund-1', 'BTCUSDT', -0.5, :t, :t)"
+        ), {"t": _now_iso()})
+        conn.commit()
+
+    # Idempotent re-run.
+    report_again = run_migrations(engine)
+    assert report_again.applied == []
+    assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
+    assert _row_counts(engine)["orders"] == before_counts["orders"]
+
+
+def test_migration_v4_only_recorded_history_with_v4_invariants_missing_is_rejected(tmp_path):
+    """Same non-contiguous/incomplete-history protection applied to the new
+    v4 boundary: a database claiming v4 without the real v4 structural
+    invariants (the unique fill index specifically) must be rejected."""
+    engine = _make_real_v3_engine(tmp_path, name="claims_v4_missing_invariants.db")
+    run_migrations(engine)  # real, consistent v4
+
+    with engine.begin() as conn:
+        conn.execute(text("DROP INDEX uq_execution_order_exchange_fill_id"))
+
+    with pytest.raises(SchemaDivergenceError):
+        current_schema_version(engine)
+    with pytest.raises(SchemaDivergenceError):
+        run_migrations(engine)
+
+
+def test_migration_v4_add_column_is_rolled_back_on_later_failure(tmp_path, monkeypatch):
+    """Adversarial reproduction of the same DDL-rollback guarantee, this
+    time starting from a real v3 database and injecting the failure inside
+    a v4-shaped migration -- proves the transactional-DDL guarantee holds
+    at this specific version boundary too, not just at v1 (correction
+    v1.4 #1's original reproduction)."""
+    import app.persistence.migrations as migrations_module
+
+    engine = _make_real_v3_engine(tmp_path, name="adversarial_v4_rollback.db")
+    real_migrations = list(migrations_module.MIGRATIONS)
+
+    schema_before = _full_schema_snapshot(engine)
+    data_before = _row_counts(engine)
+
+    def _leaks_a_column_then_fails(conn):
+        conn.execute(text("ALTER TABLE executions ADD COLUMN leaked INTEGER DEFAULT 0"))
+        raise RuntimeError("falha simulada APÓS uma alteração de esquema real (v4)")
+
+    monkeypatch.setitem(
+        migrations_module.__dict__, "MIGRATIONS",
+        [(4, "migração v4 adversarial (ALTER real, depois falha)", _leaks_a_column_then_fails)],
+    )
+
+    with pytest.raises(MigrationError):
+        run_migrations(engine)
+
+    schema_after = _full_schema_snapshot(engine)
+    assert schema_after == schema_before
+    assert "leaked" not in {c[0] for c in schema_after["executions"]["columns"]}
+    assert _row_counts(engine) == data_before
+    assert current_schema_version(engine) == 3
+
+    monkeypatch.setitem(migrations_module.__dict__, "MIGRATIONS", real_migrations)
+    report = run_migrations(engine)
+    assert report.ending_version == CURRENT_SCHEMA_VERSION

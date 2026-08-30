@@ -34,6 +34,7 @@ import hmac
 
 from fastapi import APIRouter, HTTPException, Request
 
+from app.execution import fill_service
 from app.execution.order_state import OrderStatus
 from app.persistence import repo
 from app.persistence.db import session_scope
@@ -81,12 +82,18 @@ def require_local_or_authenticated(request: Request) -> None:
 
 @router.post("/kill-switch/engage")
 def engage_kill_switch(request: Request):
-    """Fase 2, item 7.3: before considering the system stabilized, cancels
-    every non-terminal order this engine can actually cancel (has an
-    `exchange_order_id`). A pending order with no exchange_order_id yet
-    (crashed before it ever reached the exchange) can't be cancelled
-    remotely -- reconciliation, run at the end regardless, is what
-    resolves those against the exchange's real state."""
+    """Fase 2, item 7.3 / correção v1.1 #1/#4: before considering the
+    system stabilized, cancels every non-terminal order this engine can
+    actually cancel (has an `exchange_order_id`). CANCEL_PENDING is
+    persisted BEFORE the fire-and-forget `request_cancel()` call, then a
+    `poll_order()` confirms the real outcome -- if a fill won the race
+    instead, it goes through the exact same `fill_service.apply_order_snapshot`
+    every other fill path uses, so the position/Execution rows/session
+    counters are always updated consistently, never a second, divergent
+    code path. A pending order with no exchange_order_id yet (crashed
+    before it ever reached the exchange) can't be cancelled remotely --
+    reconciliation, run at the end regardless, is what resolves those
+    against the exchange's real state."""
     orch = request.app.state.orchestrator
     with session_scope(orch.session_factory) as session:
         state = repo.get_or_create_system_state(session)
@@ -96,31 +103,24 @@ def engage_kill_switch(request: Request):
             session, "KILL_SWITCH_ENGAGED", "Ativação manual do bloqueio de emergência pelo painel."
         )
 
+        op_session = orch._active_session(session, state)
         cancelled_order_ids: list[int] = []
         for order in repo.non_terminal_orders(session, mode=orch.settings.mode.value):
             if not order.exchange_order_id:
                 continue
-            result = orch.execution_engine.cancel(order.exchange_order_id)
+
+            repo.transition_order_status(
+                session, order, OrderStatus.CANCEL_PENDING,
+                detail="Cancelamento solicitado pelo bloqueio de emergência (kill switch).",
+            )
+            orch.execution_engine.request_cancel(order.exchange_order_id)
+            snapshot = orch.execution_engine.poll_order(order.exchange_order_id)
+            result = fill_service.apply_order_snapshot(
+                session, state, op_session, order, snapshot,
+                is_close=order.is_close, max_api_failures=orch.settings.risk_max_api_failures,
+            )
             if result.status == OrderStatus.CANCELLED:
-                repo.transition_order_status(
-                    session, order, OrderStatus.CANCELLED,
-                    detail="Cancelada pelo bloqueio de emergência (kill switch).",
-                )
                 cancelled_order_ids.append(order.id)
-            elif result.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
-                # Race lost to a real fill -- book it truthfully, never a
-                # fake cancel; reconcile() below settles any position drift.
-                repo.record_fill(
-                    session, order, result.status,
-                    cumulative_filled_qty=result.filled_qty, avg_fill_price=result.avg_fill_price,
-                    fees_total=result.fee,
-                    detail="Corrida de cancelamento perdida para um fill durante o kill switch.",
-                )
-            else:
-                repo.transition_order_status(
-                    session, order, OrderStatus.UNKNOWN,
-                    detail="Cancelamento pelo kill switch não pôde ser confirmado.",
-                )
 
         state.order_state_unknown = repo.has_unknown_orders(session)
         repo.recompute_trading_blocked(state, orch.settings.risk_max_api_failures)
