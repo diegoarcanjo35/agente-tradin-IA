@@ -10,7 +10,17 @@ from functools import lru_cache
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from app.core.errors import ProductionEndpointBlockedError
+from app.core.errors import ProductionEndpointBlockedError, TradingSystemError
+
+
+class UnsafeBindHostError(TradingSystemError):
+    """Raised when the API is configured to bind to a non-local address
+    without explicitly opting in -- the control API (kill switch, etc.) has
+    no authentication in this phase, so it must never be exposed by
+    accident."""
+
+
+LOCAL_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 # Only hosts on this allowlist may ever be used as the Bybit base URL. Anything
 # else (including bare "api.bybit.com", the production host) is rejected at
@@ -95,6 +105,12 @@ class Settings(BaseSettings):
     log_max_bytes: int = Field(default=5_000_000)
     log_backup_count: int = Field(default=5)
 
+    # The control API (kill switch engage/disengage) has NO authentication in
+    # this phase -- see docs/SEGURANCA.md. Binding anywhere but localhost is
+    # refused unless explicitly and separately opted into.
+    api_host: str = Field(default="127.0.0.1")
+    api_allow_external_bind: bool = Field(default=False)
+
     @field_validator("bybit_base_url", "bybit_ws_url")
     @classmethod
     def _validate_bybit_hosts_are_never_production(cls, v: str) -> str:
@@ -110,6 +126,15 @@ class Settings(BaseSettings):
                 "to be set via environment variables."
             )
 
+    def assert_safe_bind_host(self) -> None:
+        if self.api_host not in LOCAL_BIND_HOSTS and not self.api_allow_external_bind:
+            raise UnsafeBindHostError(
+                f"API_HOST={self.api_host!r} is not a local address and "
+                "API_ALLOW_EXTERNAL_BIND is not set. The control API "
+                "(kill switch, etc.) has no authentication in this phase; "
+                "refusing to start bound to a non-local address by accident."
+            )
+
 
 @lru_cache
 def get_settings() -> Settings:
@@ -118,4 +143,5 @@ def get_settings() -> Settings:
         assert_demo_host(settings.bybit_base_url)
         assert_demo_host(settings.bybit_ws_url)
         settings.require_bybit_credentials()
+    settings.assert_safe_bind_host()
     return settings

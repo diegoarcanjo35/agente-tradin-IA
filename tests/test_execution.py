@@ -9,14 +9,21 @@ import pytest
 from app.execution.bybit_demo import BybitDemoExecutionEngine
 from app.execution.idempotency import make_idempotency_key
 from app.execution.paper_local import PaperLocalExecutionEngine
-from app.risk.engine import ApprovedOrder, _RiskApprovalToken
+from app.risk.engine import ApprovedOrder, RiskEngine
 from tests.fakes.bybit_fake import FakeBybitTransport
 
 
 def make_order(qty=0.001) -> ApprovedOrder:
-    return ApprovedOrder(
+    return RiskEngine.make_test_approved_order(
         signal_id=1, symbol="BTCUSDT", side="BUY", qty=qty,
-        stop_loss=39000.0, take_profit=41000.0, token=_RiskApprovalToken(),
+        stop_loss=39000.0, take_profit=41000.0,
+    )
+
+
+def make_bybit_engine(transport, **kwargs) -> BybitDemoExecutionEngine:
+    kwargs.setdefault("sleep", lambda s: None)
+    return BybitDemoExecutionEngine(
+        "https://api-demo.bybit.com", transport.http_post, transport.http_get, **kwargs
     )
 
 
@@ -54,9 +61,7 @@ def test_paper_local_partial_fill():
 def test_bybit_demo_timeout_on_submit_does_not_crash_and_yields_error_status():
     transport = FakeBybitTransport()
     transport.fail_next_n_with_timeout = 1
-    engine = BybitDemoExecutionEngine(
-        "https://api-demo.bybit.com", transport.http_post, transport.http_get
-    )
+    engine = make_bybit_engine(transport)
     order = make_order()
     key = make_idempotency_key(order, "bucket-1")
     result = engine.submit(order, key)
@@ -66,9 +71,7 @@ def test_bybit_demo_timeout_on_submit_does_not_crash_and_yields_error_status():
 def test_bybit_demo_rate_limit_on_submit_yields_error_status():
     transport = FakeBybitTransport()
     transport.fail_next_n_with_rate_limit = 1
-    engine = BybitDemoExecutionEngine(
-        "https://api-demo.bybit.com", transport.http_post, transport.http_get
-    )
+    engine = make_bybit_engine(transport)
     order = make_order()
     key = make_idempotency_key(order, "bucket-1")
     result = engine.submit(order, key)
@@ -79,9 +82,7 @@ def test_bybit_demo_http_200_alone_is_not_treated_as_executed():
     """The create call succeeding must not be enough -- submit() must poll
     order status and only report FILLED once the exchange confirms it."""
     transport = FakeBybitTransport()
-    engine = BybitDemoExecutionEngine(
-        "https://api-demo.bybit.com", transport.http_post, transport.http_get, max_status_polls=2
-    )
+    engine = make_bybit_engine(transport, max_status_polls=2)
     order = make_order()
     key = make_idempotency_key(order, "bucket-1")
     order_id = f"EX-{key[:12]}"
@@ -93,9 +94,7 @@ def test_bybit_demo_http_200_alone_is_not_treated_as_executed():
 
 def test_bybit_demo_confirms_fill_via_status_poll():
     transport = FakeBybitTransport()
-    engine = BybitDemoExecutionEngine(
-        "https://api-demo.bybit.com", transport.http_post, transport.http_get, max_status_polls=2
-    )
+    engine = make_bybit_engine(transport, max_status_polls=2)
     order = make_order()
     key = make_idempotency_key(order, "bucket-1")
     order_id = f"EX-{key[:12]}"
@@ -109,9 +108,7 @@ def test_bybit_demo_confirms_fill_via_status_poll():
 
 def test_bybit_demo_partial_fill_via_status_poll():
     transport = FakeBybitTransport()
-    engine = BybitDemoExecutionEngine(
-        "https://api-demo.bybit.com", transport.http_post, transport.http_get, max_status_polls=2
-    )
+    engine = make_bybit_engine(transport, max_status_polls=2)
     order = make_order(qty=1.0)
     key = make_idempotency_key(order, "bucket-1")
     order_id = f"EX-{key[:12]}"
@@ -125,9 +122,7 @@ def test_bybit_demo_partial_fill_via_status_poll():
 
 def test_bybit_demo_duplicate_order_suppressed():
     transport = FakeBybitTransport()
-    engine = BybitDemoExecutionEngine(
-        "https://api-demo.bybit.com", transport.http_post, transport.http_get, max_status_polls=2
-    )
+    engine = make_bybit_engine(transport, max_status_polls=2)
     order = make_order()
     key = make_idempotency_key(order, "bucket-1")
     order_id = f"EX-{key[:12]}"

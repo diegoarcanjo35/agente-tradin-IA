@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.ai_shadow.agent import AIShadowAgent, SimulatedProvider
 from app.api import routes_control, routes_dashboard
+from app.core.clock import ReplayClockProvider
 from app.core.config import RunMode, get_settings
 from app.core.logging import get_logger, log_event, setup_logging
 from app.execution.paper_local import PaperLocalExecutionEngine
@@ -30,7 +31,15 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 logger = get_logger(__name__)
 
 
-def build_orchestrator(settings) -> Orchestrator:
+def build_orchestrator(settings, bybit_transport=None) -> Orchestrator:
+    """`bybit_transport`, when given, replaces the real pybit-backed
+    transport used in BYBIT_DEMO mode with an object exposing the same
+    `http_get(url, params)` / `http_post(url, payload)` interface (see
+    tests/fakes/bybit_fake.py::FakeBybitTransport). This exists purely so
+    tests can exercise this function's REAL wiring logic -- mode branching,
+    engine/provider construction, clock provider selection, startup
+    reconciliation -- against BYBIT_DEMO without ever importing pybit or
+    touching the network. Production code never passes this argument."""
     engine = make_engine(settings.database_url)
     init_db(engine)
     session_factory = make_session_factory(engine)
@@ -49,33 +58,54 @@ def build_orchestrator(settings) -> Orchestrator:
     )
     risk_engine = RiskEngine(limits=risk_limits)
 
-    last_price = {"value": 40000.0}
+    # Single source of truth for "the price of the candle currently driving
+    # the decision" -- the orchestrator writes it every tick; PAPER_LOCAL's
+    # price_provider only ever falls back to it if a caller forgets to pass
+    # an explicit reference_price (the orchestrator always does).
+    price_state: dict[str, float] = {}
 
     def price_provider(symbol: str) -> float:
-        return last_price["value"]
+        return price_state.get(symbol, 0.0)
 
     if settings.mode == RunMode.REPLAY:
         market_data_provider = ReplayMarketDataProvider(
             FIXTURES_DIR / "replay_btcusdt.json", symbol=settings.symbol
         )
         execution_engine = PaperLocalExecutionEngine(price_provider=price_provider)
+        clock_provider = ReplayClockProvider(drift_seconds=0.0)
     elif settings.mode == RunMode.PAPER_LOCAL:
         market_data_provider = ReplayMarketDataProvider(
             FIXTURES_DIR / "replay_btcusdt.json", symbol=settings.symbol
         )
         execution_engine = PaperLocalExecutionEngine(price_provider=price_provider)
+        clock_provider = ReplayClockProvider(drift_seconds=0.0)
     else:  # BYBIT_DEMO
         from app.execution.bybit_demo import BybitDemoExecutionEngine
-        from app.market_data.bybit_provider import BybitDemoMarketDataProvider
+        from app.execution.bybit_pybit_client import PybitTransport, build_pybit_client
+        from app.market_data.bybit_provider import BybitDemoMarketDataProvider, BybitServerTimeProvider
 
-        # Real HTTP wiring for BYBIT_DEMO is intentionally left to
-        # docs/OPERACAO_DEMO.md's operational setup step (requires the pybit
-        # client + signed requests); the constructors below already validate
-        # the base URL is demo/testnet-only and will refuse to start otherwise.
-        raise NotImplementedError(
-            "BYBIT_DEMO wiring requires a live pybit client per docs/OPERACAO_DEMO.md; "
-            "not auto-started to avoid accidental network calls."
+        # require_bybit_credentials() already ran inside get_settings() for
+        # BYBIT_DEMO, before this function is ever called -- re-checked here
+        # defensively so build_orchestrator() is safe to call directly too.
+        # This must happen BEFORE any client/transport is built, so a missing
+        # credential fails before a single network call is even possible.
+        settings.require_bybit_credentials()
+
+        if bybit_transport is not None:
+            transport = bybit_transport
+        else:
+            pybit_client = build_pybit_client(
+                settings.bybit_base_url, settings.bybit_api_key, settings.bybit_api_secret
+            )
+            transport = PybitTransport(pybit_client)
+
+        market_data_provider = BybitDemoMarketDataProvider(
+            settings.bybit_base_url, settings.symbol, "1", http_get=transport.http_get,
         )
+        execution_engine = BybitDemoExecutionEngine(
+            settings.bybit_base_url, http_post=transport.http_post, http_get=transport.http_get,
+        )
+        clock_provider = BybitServerTimeProvider(settings.bybit_base_url, http_get=transport.http_get)
 
     ai_agent = AIShadowAgent(
         provider=SimulatedProvider(),
@@ -92,8 +122,19 @@ def build_orchestrator(settings) -> Orchestrator:
         risk_engine=risk_engine,
         execution_engine=execution_engine,
         ai_agent=ai_agent,
+        clock_provider=clock_provider,
+        price_state=price_state,
     )
-    orchestrator._last_price_ref = last_price  # noqa: SLF001 - simple test/demo hook
+
+    # Startup/post-restart reconciliation (correction 8): runs for every
+    # mode. For REPLAY/PAPER_LOCAL there are no persisted open positions on a
+    # fresh DB, so this is a fast no-op; for BYBIT_DEMO it is the first real
+    # network call the process makes, and any mismatch or failure blocks
+    # trading immediately rather than trusting stale local state.
+    with session_scope(session_factory) as session:
+        state = repo.get_or_create_system_state(session)
+        orchestrator.reconcile(session, state)
+
     return orchestrator
 
 

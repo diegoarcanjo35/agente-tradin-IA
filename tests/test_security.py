@@ -63,6 +63,28 @@ def test_redact_hides_secret_like_fields():
     assert out["nested"]["qty"] == 1.0
 
 
+def test_default_settings_bind_host_is_local():
+    """Correction v1.1 #10: the control API (kill switch, etc.) has no
+    authentication in this phase, so the default configuration must stay
+    bound to localhost."""
+    settings = Settings()
+    assert settings.api_host == "127.0.0.1"
+    settings.assert_safe_bind_host()  # must not raise
+
+
+def test_external_bind_host_is_refused_without_explicit_opt_in():
+    from app.core.config import UnsafeBindHostError
+
+    settings = Settings(api_host="0.0.0.0")
+    with pytest.raises(UnsafeBindHostError):
+        settings.assert_safe_bind_host()
+
+
+def test_external_bind_host_allowed_with_explicit_opt_in():
+    settings = Settings(api_host="0.0.0.0", api_allow_external_bind=True)
+    settings.assert_safe_bind_host()  # must not raise
+
+
 def test_env_example_has_no_real_secret_values():
     env_example_path = os.path.join(
         os.path.dirname(__file__), "..", ".env.example"

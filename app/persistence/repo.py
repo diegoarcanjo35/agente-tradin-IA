@@ -42,8 +42,8 @@ def record_security_event(session: Session, event_type: str, detail: str) -> Sec
     return ev
 
 
-def record_failure(session: Session, kind: str, detail: str) -> FailureReconciliation:
-    fr = FailureReconciliation(kind=kind, detail=detail)
+def record_failure(session: Session, kind: str, detail: str, resolved: bool = False) -> FailureReconciliation:
+    fr = FailureReconciliation(kind=kind, detail=detail, resolved=resolved)
     session.add(fr)
     session.flush()
     return fr
@@ -102,12 +102,12 @@ def find_order_by_idempotency_key(session: Session, key: str) -> Order | None:
 
 
 def save_order(session: Session, idempotency_key: str, risk_evaluation_id: int, symbol: str,
-               side: str, qty: float, stop_loss: float, take_profit: float | None,
-               mode: str) -> Order:
+               side: str, qty: float, stop_loss: float | None, take_profit: float | None,
+               mode: str, is_close: bool = False) -> Order:
     o = Order(
         idempotency_key=idempotency_key, risk_evaluation_id=risk_evaluation_id,
         symbol=symbol, side=side, qty=qty, stop_loss=stop_loss, take_profit=take_profit,
-        mode=mode, status="PENDING",
+        mode=mode, status="PENDING", is_close=is_close,
     )
     session.add(o)
     session.flush()
@@ -124,19 +124,51 @@ def save_execution(session: Session, order_id: int, fill_qty: float, fill_price:
 
 
 def open_position(session: Session, symbol: str, side: str, qty: float,
-                   avg_entry_price: float, stop_loss: float, take_profit: float | None) -> Position:
+                   avg_entry_price: float, stop_loss: float | None, take_profit: float | None,
+                   opening_fee: float = 0.0) -> Position:
     p = Position(symbol=symbol, side=side, qty=qty, avg_entry_price=avg_entry_price,
-                 stop_loss=stop_loss, take_profit=take_profit, status="OPEN")
+                 stop_loss=stop_loss, take_profit=take_profit, status="OPEN",
+                 fees_paid=opening_fee)
     session.add(p)
     session.flush()
     return p
 
 
-def close_position(session: Session, position: Position, realized_pnl: float, fees_paid: float) -> None:
+def add_to_position(session: Session, position: Position, additional_qty: float,
+                     fill_price: float, fee: float) -> None:
+    """Same-side fill: increases qty and recomputes the weighted average
+    entry price. Fee is accumulated, never overwritten (Fase 1 correction 5:
+    commissions must reflect every execution across the position's life)."""
+    total_qty = position.qty + additional_qty
+    position.avg_entry_price = (
+        position.avg_entry_price * position.qty + fill_price * additional_qty
+    ) / total_qty
+    position.qty = total_qty
+    position.fees_paid += fee
+    session.flush()
+
+
+def close_position(session: Session, position: Position, realized_pnl_delta: float,
+                    closing_fee: float) -> None:
+    """Fully closes the position. `realized_pnl_delta` is the P&L from this
+    closing fill only; it is added to any P&L already realized from prior
+    partial closes on this position. `closing_fee` is accumulated onto
+    fees_paid (which already holds the opening fee and any partial-fill
+    fees), never overwritten."""
     position.status = "CLOSED"
-    position.realized_pnl = realized_pnl
-    position.fees_paid = fees_paid
+    position.realized_pnl += realized_pnl_delta
+    position.fees_paid += closing_fee
     position.closed_at = utcnow()
+    session.flush()
+
+
+def reduce_position(session: Session, position: Position, reduce_qty: float,
+                     realized_pnl_delta: float, fee: float) -> None:
+    """Partial close: reduces qty and accumulates realized P&L/fees without
+    closing the position."""
+    position.qty -= reduce_qty
+    position.realized_pnl += realized_pnl_delta
+    position.fees_paid += fee
     session.flush()
 
 

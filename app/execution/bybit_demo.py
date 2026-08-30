@@ -9,6 +9,7 @@ a status confirmation call before returning a FILLED/PARTIALLY_FILLED result.
 """
 from __future__ import annotations
 
+import time
 from typing import Callable
 
 from app.core.config import assert_demo_host
@@ -27,15 +28,23 @@ class BybitDemoExecutionEngine:
         http_post: Callable[[str, dict], dict],
         http_get: Callable[[str, dict], dict],
         max_status_polls: int = 5,
+        poll_interval_seconds: float = 0.5,
+        sleep: Callable[[float], None] = time.sleep,
     ):
         assert_demo_host(base_url)
         self.base_url = base_url
         self._http_post = http_post
         self._http_get = http_get
         self.max_status_polls = max_status_polls
+        self.poll_interval_seconds = poll_interval_seconds
+        self._sleep = sleep
         self._seen_keys: dict[str, FillResult] = {}
 
-    def submit(self, order: ApprovedOrder, idempotency_key: str) -> FillResult:
+    def submit(
+        self, order: ApprovedOrder, idempotency_key: str, reference_price: float | None = None
+    ) -> FillResult:
+        # reference_price is intentionally unused: BYBIT_DEMO always fills at
+        # whatever price the exchange actually reports, never a local guess.
         if idempotency_key in self._seen_keys:
             log_event(logger, 30, "duplicate_order_suppressed", idempotency_key=idempotency_key)
             return self._seen_keys[idempotency_key]
@@ -49,8 +58,9 @@ class BybitDemoExecutionEngine:
                     "side": "Buy" if order.side == "BUY" else "Sell",
                     "orderType": "Market",
                     "qty": f"{order.qty:.8f}",
-                    "stopLoss": f"{order.stop_loss:.2f}",
+                    "stopLoss": f"{order.stop_loss:.2f}" if order.stop_loss is not None else None,
                     "takeProfit": f"{order.take_profit:.2f}" if order.take_profit else None,
+                    "reduceOnly": order.is_close,
                     "orderLinkId": idempotency_key,
                 },
             )
@@ -75,7 +85,9 @@ class BybitDemoExecutionEngine:
         return result
 
     def _confirm_status(self, order: ApprovedOrder, exchange_order_id: str, idempotency_key: str) -> FillResult:
-        for _ in range(self.max_status_polls):
+        for attempt in range(self.max_status_polls):
+            if attempt > 0:
+                self._sleep(self.poll_interval_seconds)
             try:
                 status_resp = self._http_get(
                     f"{self.base_url}/v5/order/realtime",

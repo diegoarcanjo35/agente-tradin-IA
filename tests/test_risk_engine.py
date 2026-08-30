@@ -1,6 +1,10 @@
 """Covers spec section 7 items 7-12: missing stop, daily loss limit, max
 exposure, cooldown, kill switch, stale data -- plus the structural guarantee
-that only the Risk Engine can produce an ApprovedOrder.
+that only the Risk Engine can produce an ApprovedOrder, for both opening
+(evaluate) and closing (evaluate_close) flows (correction v1.1 #2).
+
+Per correction v1.1, tests never import the private approval-token type --
+they use RiskEngine's controlled test-only factories instead.
 """
 from __future__ import annotations
 
@@ -9,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.risk.config import RiskLimits
-from app.risk.engine import ApprovedOrder, RiskContext, RiskEngine, _RiskApprovalToken
+from app.risk.engine import RiskContext, RiskEngine
 from app.strategy.schemas import Signal
 
 NOW = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
@@ -28,7 +32,7 @@ def base_context(**overrides) -> RiskContext:
         open_positions_count=0, open_exposure_usd=0.0, daily_realized_loss_usd=0.0,
         consecutive_losses=0, data_is_stale=False, api_failure_count=0,
         clock_drift_seconds=0.0, kill_switch_engaged=False, trading_blocked=False,
-        cooldown_until=None, now=NOW,
+        state_ambiguous=False, cooldown_until=None, now=NOW,
     )
     defaults.update(overrides)
     return RiskContext(**defaults)
@@ -56,7 +60,6 @@ def test_rejects_when_daily_loss_limit_reached():
     ctx = base_context(daily_realized_loss_usd=30.0)
     result = engine.evaluate(make_signal(), signal_id=1, context=ctx)
     assert not result.approved
-    assert "daily" in result.reason.lower() or "diário" in result.reason.lower() or True
     assert not result.checks["daily_loss_within_limit"]
 
 
@@ -114,19 +117,152 @@ def test_rejects_when_trading_blocked():
     assert not result.approved
 
 
+def test_rejects_when_state_ambiguous():
+    engine = RiskEngine(RiskLimits())
+    ctx = base_context(state_ambiguous=True)
+    result = engine.evaluate(make_signal(), signal_id=1, context=ctx)
+    assert not result.approved
+    assert not result.checks["state_not_ambiguous"]
+
+
+def test_rejects_when_clock_drift_unknown():
+    """clock_drift_seconds=None means the reference clock could not be
+    verified -- must never be treated as drift=0."""
+    engine = RiskEngine(RiskLimits())
+    ctx = base_context(clock_drift_seconds=None)
+    result = engine.evaluate(make_signal(), signal_id=1, context=ctx)
+    assert not result.approved
+    assert not result.checks["clock_synced"]
+
+
 def test_execution_requires_risk_approval():
-    """ApprovedOrder cannot be constructed without a genuine
-    _RiskApprovalToken instance -- proving the Execution Engine's only input
-    type is unforgeable outside app/risk/engine.py."""
+    """ApprovedOrder cannot be constructed without a genuine internal
+    approval token -- proving the Execution Engine's only input type is
+    unforgeable outside app/risk/engine.py."""
     with pytest.raises(TypeError):
-        ApprovedOrder(
-            signal_id=1, symbol="BTCUSDT", side="BUY", qty=0.001,
-            stop_loss=39000.0, take_profit=41000.0, token=object(),
-        )
+        RiskEngine.attempt_construct_with_invalid_token_for_testing(object())
 
     # A genuine token still works (this is how RiskEngine.evaluate() builds one).
-    order = ApprovedOrder(
+    order = RiskEngine.make_test_approved_order(
         signal_id=1, symbol="BTCUSDT", side="BUY", qty=0.001,
-        stop_loss=39000.0, take_profit=41000.0, token=_RiskApprovalToken(),
+        stop_loss=39000.0, take_profit=41000.0,
     )
     assert order.side == "BUY"
+
+
+# --- evaluate_close() -------------------------------------------------
+
+def close_context(**overrides) -> RiskContext:
+    return base_context(**overrides)
+
+
+def test_evaluate_close_approves_valid_close():
+    engine = RiskEngine(RiskLimits())
+    result = engine.evaluate_close(
+        signal_id=1, symbol="BTCUSDT", close_side="SELL", qty=0.001,
+        position_exists=True, position_qty=0.001, position_side="BUY",
+        context=close_context(),
+    )
+    assert result.approved
+    assert result.approved_order is not None
+    assert result.approved_order.is_close is True
+
+
+def test_evaluate_close_ignores_open_only_limits():
+    """Daily loss cap, concurrent-position cap, and exposure cap must never
+    block a close -- closing reduces risk."""
+    engine = RiskEngine(RiskLimits(max_daily_loss_usd=1.0, max_concurrent_positions=0,
+                                    max_total_exposure_usd=1.0))
+    result = engine.evaluate_close(
+        signal_id=1, symbol="BTCUSDT", close_side="SELL", qty=0.001,
+        position_exists=True, position_qty=0.001, position_side="BUY",
+        context=close_context(daily_realized_loss_usd=1000.0),
+    )
+    assert result.approved
+
+
+def test_evaluate_close_rejects_when_kill_switch_engaged():
+    engine = RiskEngine(RiskLimits())
+    result = engine.evaluate_close(
+        signal_id=1, symbol="BTCUSDT", close_side="SELL", qty=0.001,
+        position_exists=True, position_qty=0.001, position_side="BUY",
+        context=close_context(kill_switch_engaged=True),
+    )
+    assert not result.approved
+
+
+def test_evaluate_close_rejects_when_trading_blocked():
+    engine = RiskEngine(RiskLimits())
+    result = engine.evaluate_close(
+        signal_id=1, symbol="BTCUSDT", close_side="SELL", qty=0.001,
+        position_exists=True, position_qty=0.001, position_side="BUY",
+        context=close_context(trading_blocked=True),
+    )
+    assert not result.approved
+
+
+def test_evaluate_close_rejects_when_state_ambiguous():
+    engine = RiskEngine(RiskLimits())
+    result = engine.evaluate_close(
+        signal_id=1, symbol="BTCUSDT", close_side="SELL", qty=0.001,
+        position_exists=True, position_qty=0.001, position_side="BUY",
+        context=close_context(state_ambiguous=True),
+    )
+    assert not result.approved
+    assert not result.checks["state_not_ambiguous"]
+
+
+def test_evaluate_close_rejects_on_stale_data():
+    engine = RiskEngine(RiskLimits())
+    result = engine.evaluate_close(
+        signal_id=1, symbol="BTCUSDT", close_side="SELL", qty=0.001,
+        position_exists=True, position_qty=0.001, position_side="BUY",
+        context=close_context(data_is_stale=True),
+    )
+    assert not result.approved
+
+
+def test_evaluate_close_rejects_no_position():
+    engine = RiskEngine(RiskLimits())
+    result = engine.evaluate_close(
+        signal_id=1, symbol="BTCUSDT", close_side="SELL", qty=0.001,
+        position_exists=False, position_qty=0.0, position_side="BUY",
+        context=close_context(),
+    )
+    assert not result.approved
+    assert not result.checks["position_exists"]
+
+
+def test_evaluate_close_rejects_non_positive_qty():
+    engine = RiskEngine(RiskLimits())
+    result = engine.evaluate_close(
+        signal_id=1, symbol="BTCUSDT", close_side="SELL", qty=0.0,
+        position_exists=True, position_qty=0.001, position_side="BUY",
+        context=close_context(),
+    )
+    assert not result.approved
+    assert not result.checks["qty_positive"]
+
+
+def test_evaluate_close_rejects_qty_exceeding_position():
+    engine = RiskEngine(RiskLimits())
+    result = engine.evaluate_close(
+        signal_id=1, symbol="BTCUSDT", close_side="SELL", qty=0.01,
+        position_exists=True, position_qty=0.001, position_side="BUY",
+        context=close_context(),
+    )
+    assert not result.approved
+    assert not result.checks["qty_within_position"]
+
+
+def test_evaluate_close_rejects_wrong_side():
+    """close_side must be the opposite of the position's side -- a BUY
+    position can only be closed by a SELL, and vice versa."""
+    engine = RiskEngine(RiskLimits())
+    result = engine.evaluate_close(
+        signal_id=1, symbol="BTCUSDT", close_side="BUY",
+        qty=0.001, position_exists=True, position_qty=0.001, position_side="BUY",
+        context=close_context(),
+    )
+    assert not result.approved
+    assert not result.checks["close_side_valid"]

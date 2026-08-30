@@ -53,16 +53,39 @@ não há troca de modo em tempo de execução.
 4. Clique em "Disengage" para retomar.
 5. Reprodução automatizada: `pytest tests/test_orchestrator.py::test_kill_switch_blocks_new_orders`.
 
+## Stop-loss / take-profit (REPLAY e PAPER_LOCAL)
+
+A cada candle, se houver posição aberta no símbolo, o sistema verifica se a
+faixa `[low, high]` do candle tocou o stop-loss ou o take-profit da posição
+(`Orchestrator._check_stop_take`, `app/orchestrator.py`):
+
+- Posição `BUY`: stop tocado se `low <= stop_loss`; alvo tocado se
+  `high >= take_profit`.
+- Posição `SELL`: stop tocado se `high >= stop_loss`; alvo tocado se
+  `low <= take_profit`.
+- **Regra conservadora**: como não há informação intrabar (sequência exata
+  dos preços dentro do candle), se ambos forem tocados no mesmo candle o
+  sistema assume que o stop-loss foi atingido primeiro (pior cenário). Isso é
+  registrado explicitamente na justificativa do sinal de fechamento gerado.
+- O fechamento por stop/take sempre passa por `RiskEngine.evaluate_close()`,
+  aplica slippage configurável, gera ordem/execução/taxa persistidas, e
+  atualiza a sequência de perdas consecutivas / cooldown como qualquer outro
+  fechamento.
+
 ## Limitações conhecidas
 
 - A estratégia (cruzamento de médias móveis + filtro ATR) é intencionalmente
   simples e não promete rentabilidade.
 - `PAPER_LOCAL` reutiliza a fonte de dados de replay nesta fase; um feed de
   mercado ao vivo somente-leitura fica como extensão futura.
-- O wiring completo de `BYBIT_DEMO` (cliente `pybit` real, assinatura de
-  requisições, WebSocket) está implementado nos módulos
-  (`app/execution/bybit_demo.py`, `app/market_data/bybit_provider.py`) e
-  coberto por testes com transporte falso, mas a montagem final com
-  credenciais reais deve ser feita seguindo este documento antes do primeiro
-  uso contra a Bybit.
+- O wiring completo de `BYBIT_DEMO` usa o cliente oficial `pybit`
+  (`app/execution/bybit_pybit_client.py`) para dados de mercado, envio de
+  ordens, confirmação de status e consulta de posições, sempre contra hosts
+  da allowlist demo/testnet. Testado ponta a ponta com transporte falso em
+  `tests/test_bybit_demo_wiring.py` (zero rede); o primeiro uso real ainda
+  deve seguir este documento para gerar e configurar credenciais.
+- O motor de risco só permite `RISK_MAX_CONCURRENT_POSITIONS=1` por padrão;
+  o preenchimento parcial de uma abertura não é automaticamente
+  complementado em ticks futuros (fica registrado como posição parcial, sem
+  nova tentativa automática de completar o tamanho aprovado).
 - Sem garantia de rentabilidade. Ambiente exclusivamente demonstrativo.

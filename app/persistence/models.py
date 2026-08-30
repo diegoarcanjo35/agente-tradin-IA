@@ -92,8 +92,9 @@ class Order(Base):
     symbol: Mapped[str] = mapped_column(String(32), index=True)
     side: Mapped[str] = mapped_column(String(8))
     qty: Mapped[float] = mapped_column(Float)
-    stop_loss: Mapped[float] = mapped_column(Float)
+    stop_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
     take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    is_close: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(16), default="PENDING")
     exchange_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     mode: Mapped[str] = mapped_column(String(16))  # PAPER_LOCAL | BYBIT_DEMO
@@ -177,4 +178,5 @@ class SystemState(Base):
     consecutive_losses: Mapped[int] = mapped_column(Integer, default=0)
     cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     api_failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    state_ambiguous: Mapped[bool] = mapped_column(Boolean, default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

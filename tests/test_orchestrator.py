@@ -6,6 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.ai_shadow.agent import AIShadowAgent, SimulatedProvider
+from app.core.clock import ReplayClockProvider
 from app.core.config import RunMode, Settings
 from app.execution.paper_local import PaperLocalExecutionEngine
 from app.market_data.replay_provider import ReplayMarketDataProvider
@@ -24,13 +25,14 @@ def build_orchestrator(session_factory) -> Orchestrator:
     market_data_provider = ReplayMarketDataProvider(FIXTURE, symbol=settings.symbol)
     strategy_engine = StrategyEngine(symbol=settings.symbol)
     risk_engine = RiskEngine(RiskLimits(max_position_usd=50.0, max_total_exposure_usd=50.0))
-    last_price = {"value": 40000.0}
-    execution_engine = PaperLocalExecutionEngine(price_provider=lambda s: last_price["value"])
+    price_state: dict[str, float] = {}
+    execution_engine = PaperLocalExecutionEngine(price_provider=lambda s: price_state.get(s, 0.0))
     ai_agent = AIShadowAgent(provider=SimulatedProvider(), timeout_seconds=2.0)
     return Orchestrator(
         settings=settings, session_factory=session_factory,
         market_data_provider=market_data_provider, strategy_engine=strategy_engine,
         risk_engine=risk_engine, execution_engine=execution_engine, ai_agent=ai_agent,
+        clock_provider=ReplayClockProvider(drift_seconds=0.0), price_state=price_state,
     )
 
 

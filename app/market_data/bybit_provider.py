@@ -105,3 +105,26 @@ class BybitDemoMarketDataProvider:
     @property
     def consecutive_failures(self) -> int:
         return self._consecutive_failures
+
+
+class BybitServerTimeProvider:
+    """Implements app.core.clock.RemoteTimeProvider against Bybit's public
+    server-time endpoint. Raises (never guesses) if the exchange cannot be
+    reached or returns a response we cannot parse -- app.core.clock's
+    compute_clock_sync() treats that as "cannot verify sync" and blocks
+    trading rather than assuming drift=0."""
+
+    def __init__(self, base_url: str, http_get: Callable[[str, dict], dict]):
+        assert_demo_host(base_url)
+        self.base_url = base_url
+        self._http_get = http_get
+
+    def get_remote_epoch_seconds(self) -> float:
+        resp = self._http_get(f"{self.base_url}/v5/market/time", {})
+        result = resp.get("result", {})
+        # Bybit v5 returns timeSecond (string) and timeNano.
+        if "timeSecond" in result:
+            return float(result["timeSecond"])
+        if "timeNano" in result:
+            return float(result["timeNano"]) / 1_000_000_000.0
+        raise ExchangeTimeoutError("Bybit server time response missing timeSecond/timeNano.")
