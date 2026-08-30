@@ -4,7 +4,7 @@ the API surface, per the non-negotiable "no Demo/Real switch" requirement.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
 
@@ -127,6 +127,12 @@ class Settings(BaseSettings):
     # this timestamp instead of the default "most recent closed candle at
     # boot" baseline (see app/market_data/bybit_provider.py). Never implies
     # an unbounded "recover all history" attempt either way.
+    #
+    # Correction v1.6: always normalized to a timezone-AWARE UTC datetime by
+    # `_normalize_market_data_initial_start` below -- a naive datetime must
+    # never reach the provider (it would blow up comparing against the
+    # timezone-aware candle timestamps from Bybit). See docs/OPERACAO_DEMO.md
+    # for the accepted formats and the policy for values with no timezone.
     market_data_initial_start: datetime | None = Field(default=None)
 
     # Risk defaults (conservative). See app/risk/config.py for the dataclass
@@ -173,6 +179,63 @@ class Settings(BaseSettings):
         # value can never be set even if mode is later flipped without restart.
         assert_demo_host(v)
         return v
+
+    @field_validator("market_data_initial_start", mode="before")
+    @classmethod
+    def _normalize_market_data_initial_start(cls, v):
+        """Correction v1.6: reproduced defect was
+        `MARKET_DATA_INITIAL_START=2024-06-01T12:00:00` (no timezone) being
+        accepted as a naive `datetime`, which later blew up comparing
+        against timezone-aware candle timestamps inside
+        `BybitDemoMarketDataProvider._fetch_window()`
+        (`TypeError: can't compare offset-naive and offset-aware
+        datetimes`). Fixed here, at the earliest possible point (Settings
+        construction, at process startup) so a bad value fails loudly
+        before a single HTTP request is ever made -- never only during the
+        first polling tick.
+
+        Policy chosen (documented in docs/OPERACAO_DEMO.md):
+        - a value WITH an explicit timezone/offset ('Z' or '+HH:MM'/'-HH:MM')
+          is accepted and converted to the equivalent UTC instant;
+        - a value with NO timezone is accepted and interpreted AS UTC
+          (never left naive) -- the "alternativa aceitável" from the
+          correction, chosen over outright rejection to keep the common
+          case (an operator typing a plain local-looking timestamp,
+          intending UTC) working without friction, while still never
+          letting a naive datetime escape this validator;
+        - a syntactically invalid value fails Settings construction
+          immediately with a clear Portuguese message;
+        - a value in the future is accepted as-is: the provider treats it
+          exactly like any other cursor in the future -- it simply reports
+          NO_NEW_CANDLE until real time reaches it, and (like any other
+          cursor) never delivers a candle that hasn't actually closed yet."""
+        if v is None or v == "":
+            return None
+        if isinstance(v, datetime):
+            dt = v
+        elif isinstance(v, str):
+            text = v.strip()
+            if text.endswith("Z") or text.endswith("z"):
+                text = text[:-1] + "+00:00"
+            try:
+                dt = datetime.fromisoformat(text)
+            except ValueError as exc:
+                raise ValueError(
+                    f"MARKET_DATA_INITIAL_START inválido: {v!r} não é um timestamp ISO 8601 "
+                    f"reconhecível. Formatos aceitos: '2024-06-01T12:00:00Z' (UTC explícito), "
+                    f"'2024-06-01T09:00:00-03:00' (com offset), ou '2024-06-01T12:00:00' (sem "
+                    f"timezone -- interpretado como UTC). Causa original: {exc}"
+                ) from exc
+        else:
+            raise ValueError(
+                f"MARKET_DATA_INITIAL_START deve ser uma string de timestamp ISO 8601 ou um "
+                f"datetime; recebido tipo {type(v).__name__}."
+            )
+
+        if dt.tzinfo is None:
+            # Sem timezone explícito -- política escolhida: interpretar como UTC.
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
 
     def require_bybit_credentials(self) -> None:
         if not self.bybit_api_key or not self.bybit_api_secret:

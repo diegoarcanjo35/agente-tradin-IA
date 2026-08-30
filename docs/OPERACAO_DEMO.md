@@ -140,8 +140,47 @@ políticas explícitas e determinísticas, nunca uma recuperação irrestrita:
   mais antigo ao mais novo — nunca os candles mais antigos que ficam fora
   dessa janela.
 
-Em ambos os casos, toda consulta ao primeiro boot também carrega `start` e
-`end`, e o baseline escolhido é registrado em log
+#### Formato e timezone de `MARKET_DATA_INITIAL_START` (correção v1.6)
+
+Uma auditoria reproduziu um defeito real: `MARKET_DATA_INITIAL_START=
+2024-06-01T12:00:00` (sem timezone) virava um `datetime` "ingênuo" (sem
+`tzinfo`), que quebrava na primeira consulta ao comparar com os timestamps
+de candles vindos da Bybit (sempre com timezone UTC explícito):
+
+```text
+TypeError: can't compare offset-naive and offset-aware datetimes
+```
+
+Corrigido em `app/core/config.py::Settings._normalize_market_data_initial_start`
+— roda na própria construção do `Settings`, ou seja, **antes** de qualquer
+requisição HTTP, então um valor inválido interrompe a inicialização
+imediatamente, nunca só durante o primeiro polling. Política adotada:
+
+- **Formato aceito**: qualquer timestamp ISO 8601, ex.:
+  `2024-06-01T12:00:00Z`, `2024-06-01T09:00:00-03:00`,
+  `2024-06-01T12:00:00`.
+- **Timezone**: um valor com `Z` ou offset explícito (`+HH:MM`/`-HH:MM`) é
+  convertido para o instante UTC equivalente. Um valor **sem** timezone é
+  aceito e interpretado como UTC — nunca fica "ingênuo"; o campo
+  `Settings.market_data_initial_start` é sempre um `datetime` com `tzinfo`
+  definido (UTC) depois de validado, e um `datetime` ingênuo nunca alcança
+  o provider, comparações de cursor, nem `.timestamp()`.
+- **Valor inválido**: a construção de `Settings()` (portanto a
+  inicialização do processo) falha imediatamente com `ValidationError`
+  contendo uma mensagem em português explicando os formatos aceitos.
+- **Valor no futuro**: aceito normalmente — o provider trata como
+  qualquer outro cursor: reporta `NO_NEW_CANDLE` até o relógio real
+  alcançá-lo, e (como qualquer cursor) nunca entrega um candle que ainda
+  não fechou.
+
+Testado em `tests/test_market_data_initial_start_timezone.py`: valor com
+`Z`, valor com offset negativo, valor sem timezone, valor sintaticamente
+inválido, valor no futuro, integração real `Settings` →
+`BybitDemoMarketDataProvider.next_candle()`, e regressão do backlog de 17
+candles com `initial_start` vindo do `Settings` normalizado.
+
+Em ambos os casos (configurado ou padrão), toda consulta ao primeiro boot
+também carrega `start` e `end`, e o baseline escolhido é registrado em log
 (`market_data_bootstrap_configured_start` / `market_data_bootstrap_baseline`).
 Uma vez que qualquer candle é persistido, `sync_cursor()` (alimentado pelo
 banco) sempre tem prioridade sobre essa política de primeiro boot em
