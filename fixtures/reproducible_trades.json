@@ -1,0 +1,18 @@
+{
+  "starting_balance": 1000.0,
+  "closed_trades": [
+    {"note": "win 1", "realized_pnl": 50.0, "fees_paid": 1.0, "opened_at": "2024-02-01T00:00:00+00:00", "closed_at": "2024-02-01T01:00:00+00:00"},
+    {"note": "win 2", "realized_pnl": 30.0, "fees_paid": 1.0, "opened_at": "2024-02-02T00:00:00+00:00", "closed_at": "2024-02-02T01:00:00+00:00"},
+    {"note": "loss 1 (start of losing streak)", "realized_pnl": -20.0, "fees_paid": 1.0, "opened_at": "2024-02-03T00:00:00+00:00", "closed_at": "2024-02-03T01:00:00+00:00"},
+    {"note": "loss 2", "realized_pnl": -15.0, "fees_paid": 1.0, "opened_at": "2024-02-04T00:00:00+00:00", "closed_at": "2024-02-04T01:00:00+00:00"},
+    {"note": "loss 3, includes simulated slippage/partial-fill cost", "realized_pnl": -25.0, "fees_paid": 1.0, "opened_at": "2024-02-05T00:00:00+00:00", "closed_at": "2024-02-05T01:00:00+00:00"},
+    {"note": "win 3, recovery", "realized_pnl": 40.0, "fees_paid": 1.0, "opened_at": "2024-02-06T00:00:00+00:00", "closed_at": "2024-02-06T01:00:00+00:00"}
+  ],
+  "open_position": {
+    "symbol": "BTCUSDT",
+    "side": "BUY",
+    "qty": 0.0005,
+    "avg_entry_price": 42000.0,
+    "note": "still open at end of scenario; must not be counted in realized P&L"
+  }
+}

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Agente Trader Demo</title>
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="banner">AMBIENTE DEMO — SEM DINHEIRO REAL</div>
+
+  <header class="topbar">
+    <h1>Agente de Trading IA — Fase 1</h1>
+    <div class="status-chips">
+      <span id="chip-mode" class="chip">MODO: --</span>
+      <span id="chip-conn" class="chip">CONEXÃO: --</span>
+      <span id="chip-trading" class="chip">TRADING: --</span>
+      <span id="chip-kill" class="chip">KILL SWITCH: --</span>
+    </div>
+    <button id="btn-kill" class="btn-danger">Engage Kill Switch</button>
+    <button id="btn-unkill" class="btn-secondary">Disengage</button>
+  </header>
+
+  <main>
+    <section class="grid">
+      <div class="card">
+        <h2>Saldo &amp; Equity</h2>
+        <div id="account-box">Carregando...</div>
+      </div>
+      <div class="card">
+        <h2>P&amp;L</h2>
+        <div id="pnl-box">Carregando...</div>
+      </div>
+      <div class="card">
+        <h2>Métricas</h2>
+        <div id="metrics-box">Carregando...</div>
+      </div>
+      <div class="card">
+        <h2>Drawdown / Profit Factor</h2>
+        <div id="risk-metrics-box">Carregando...</div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Curva de Equity</h2>
+      <canvas id="equity-canvas" width="900" height="220"></canvas>
+    </section>
+
+    <section class="grid-2">
+      <div class="card">
+        <h2>Posições Abertas</h2>
+        <table id="positions-table"><thead><tr><th>Símbolo</th><th>Lado</th><th>Qtd</th><th>Entrada</th><th>Stop</th><th>Alvo</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="card">
+        <h2>Sinais da Estratégia</h2>
+        <table id="signals-table"><thead><tr><th>Hora</th><th>Direção</th><th>Preço</th><th>Justificativa</th></tr></thead><tbody></tbody></table>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <div class="card">
+        <h2>Decisões do Risk Engine</h2>
+        <table id="risk-table"><thead><tr><th>Hora</th><th>Aprovado</th><th>Motivo</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="card">
+        <h2>IA em Shadow Mode</h2>
+        <table id="ai-table"><thead><tr><th>Hora</th><th>Recomendação</th><th>Confiança</th><th>Resumo</th></tr></thead><tbody></tbody></table>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Histórico de Erros</h2>
+      <table id="failures-table"><thead><tr><th>Hora</th><th>Tipo</th><th>Detalhe</th></tr></thead><tbody></tbody></table>
+    </section>
+
+    <footer>
+      <span>Última atualização: <span id="last-updated">--</span></span>
+      <p class="disclaimer">Este sistema opera exclusivamente no ambiente Demo/Testnet da Bybit. Não há garantia de rentabilidade. Nenhuma operação envolve dinheiro real.</p>
+    </footer>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
