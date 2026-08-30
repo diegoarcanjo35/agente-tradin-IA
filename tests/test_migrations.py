@@ -14,6 +14,8 @@ from app.persistence.db import make_engine, make_session_factory, session_scope
 from app.persistence.migrations import (
     CURRENT_SCHEMA_VERSION,
     MigrationError,
+    SchemaDivergenceError,
+    _table_exists,
     current_schema_version,
     run_migrations,
 )
@@ -305,11 +307,28 @@ def test_v1_database_only_needs_migration_2(tmp_path):
     nullable stop_loss already present, but not clock_out_of_sync) must
     only apply migration 2, never re-run the orders table rebuild."""
     engine = _make_legacy_v0_engine(tmp_path, name="v0_then_v1.db")
-    # Fast-forward this DB to "v1 shape" by hand, bypassing the migrator,
-    # to simulate a database that was created directly by v1.1 app code.
+    # Fast-forward this DB to a GENUINE v1 shape by hand, bypassing the
+    # migrator, to simulate a database that was created directly by v1.1
+    # app code -- this must satisfy ALL v1 invariants (correction v1.4 #3),
+    # including orders.stop_loss actually being nullable, not just the
+    # presence of the new columns.
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE system_state ADD COLUMN state_ambiguous BOOLEAN NOT NULL DEFAULT 0"))
-        conn.execute(text("ALTER TABLE orders ADD COLUMN is_close BOOLEAN NOT NULL DEFAULT 0"))
+        conn.execute(text(
+            "CREATE TABLE orders_v1_fixture ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, idempotency_key VARCHAR(128) NOT NULL, "
+            "risk_evaluation_id INTEGER NOT NULL, symbol VARCHAR(32) NOT NULL, side VARCHAR(8) NOT NULL, "
+            "qty FLOAT NOT NULL, stop_loss FLOAT, take_profit FLOAT, is_close BOOLEAN NOT NULL DEFAULT 0, "
+            "status VARCHAR(16) NOT NULL, exchange_order_id VARCHAR(128), mode VARCHAR(16) NOT NULL, "
+            "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL"
+            ")"
+        ))
+        conn.execute(text(
+            "INSERT INTO orders_v1_fixture SELECT id, idempotency_key, risk_evaluation_id, symbol, side, "
+            "qty, stop_loss, take_profit, 0, status, exchange_order_id, mode, created_at, updated_at FROM orders"
+        ))
+        conn.execute(text("DROP TABLE orders"))
+        conn.execute(text("ALTER TABLE orders_v1_fixture RENAME TO orders"))
 
     assert current_schema_version(engine) == 1
 
@@ -372,11 +391,197 @@ def test_migration_failure_rolls_back_and_never_records_partial_success(tmp_path
     assert "banco permanece na versão" in str(excinfo.value)
 
     # Nothing was recorded as applied, and the original data is untouched.
+    # (With real transactional DDL, correction v1.4 #1: even the
+    # `CREATE TABLE IF NOT EXISTS schema_migrations` from earlier in the
+    # same transaction is rolled back, so the table may not exist at all --
+    # that is a STRONGER guarantee than "exists but empty", not a weaker one.)
     with engine.connect() as conn:
-        applied = conn.execute(text("SELECT version FROM schema_migrations")).fetchall()
-        assert applied == []
+        if _table_exists(conn, "schema_migrations"):
+            applied = conn.execute(text("SELECT version FROM schema_migrations")).fetchall()
+            assert applied == []
         cols = {r[1] for r in conn.execute(text("PRAGMA table_info(system_state)")).fetchall()}
         assert "state_ambiguous" not in cols  # the failed migration's change was rolled back
 
     after_counts = _row_counts(engine)
     assert all(c == 1 for c in after_counts.values())
+
+
+def _full_schema_snapshot(engine) -> dict:
+    """Every table, column, and index in the database -- used to prove a
+    rolled-back migration leaves ABSOLUTELY nothing behind, not just the
+    one column/table a narrower test happens to check."""
+    with engine.connect() as conn:
+        tables = sorted(
+            r[0] for r in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+            ).fetchall()
+        )
+        snapshot = {}
+        for table in tables:
+            columns = sorted(
+                (r[1], r[2], r[3]) for r in conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+            )  # (name, type, notnull)
+            indexes = sorted(
+                r[1] for r in conn.execute(text(f"PRAGMA index_list({table})")).fetchall()
+            )
+            snapshot[table] = {"columns": columns, "indexes": indexes}
+        return snapshot
+
+
+def test_alter_table_add_column_is_rolled_back_on_later_failure(tmp_path, monkeypatch):
+    """Adversarial reproduction of the exact failure the audit found: a
+    migration that ACTUALLY executes `ALTER TABLE ... ADD COLUMN` and only
+    THEN raises. Before correction v1.4 #1, SQLite's implicit
+    driver-level autocommit on DDL meant the ADD COLUMN survived the
+    "rollback" regardless -- this proves it no longer does, across the
+    full schema and full data, not just one column."""
+    import app.persistence.migrations as migrations_module
+
+    engine = _make_legacy_v0_engine(tmp_path, name="adversarial_rollback.db")
+    real_migrations = list(migrations_module.MIGRATIONS)
+
+    schema_before = _full_schema_snapshot(engine)
+    data_before = _row_counts(engine)
+
+    def _leaks_a_column_then_fails(conn):
+        conn.execute(text("ALTER TABLE system_state ADD COLUMN leaked INTEGER DEFAULT 0"))
+        raise RuntimeError("falha simulada APÓS uma alteração de esquema real")
+
+    monkeypatch.setitem(
+        migrations_module.__dict__, "MIGRATIONS",
+        [(1, "migração adversarial (ALTER real, depois falha)", _leaks_a_column_then_fails)],
+    )
+
+    with pytest.raises(MigrationError):
+        run_migrations(engine)
+
+    # 1. Full schema (every table/column/index) is byte-for-byte identical
+    #    to before the attempt -- not just "system_state" spot-checked.
+    schema_after = _full_schema_snapshot(engine)
+    assert schema_after == schema_before
+    assert "leaked" not in {c[0] for c in schema_after["system_state"]["columns"]}
+
+    # 2. Full data is untouched.
+    assert _row_counts(engine) == data_before
+
+    # 3. No partial version was recorded. With real transactional DDL, the
+    #    CREATE TABLE IF NOT EXISTS schema_migrations issued earlier in the
+    #    SAME transaction is also rolled back -- so the table not existing
+    #    at all is the correct (stronger) outcome, not a bug.
+    with engine.connect() as conn:
+        if _table_exists(conn, "schema_migrations"):
+            migration_rows = conn.execute(text("SELECT version FROM schema_migrations")).fetchall()
+            assert migration_rows == []
+
+    # 4. A clean retry (with the real migrations restored) succeeds normally.
+    monkeypatch.setitem(migrations_module.__dict__, "MIGRATIONS", real_migrations)
+    report = run_migrations(engine)
+    assert report.ending_version == CURRENT_SCHEMA_VERSION
+    assert _row_counts(engine) == data_before
+
+
+# --- Correction v1.4 #3: full structural invariants, not one sentinel column ---
+
+def test_clock_out_of_sync_present_but_unique_index_missing_is_detected_as_v1(tmp_path):
+    """A database with system_state.clock_out_of_sync (the v2 sentinel
+    column) but WITHOUT the candles unique index must be classified as v1,
+    not v2 -- and migrating it must still create the missing index."""
+    engine = _make_legacy_v0_engine(tmp_path, name="partial_v2_no_index.db")
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE system_state ADD COLUMN state_ambiguous BOOLEAN NOT NULL DEFAULT 0"))
+        conn.execute(text("ALTER TABLE orders ADD COLUMN is_close BOOLEAN NOT NULL DEFAULT 0"))
+        conn.execute(text("ALTER TABLE system_state ADD COLUMN clock_out_of_sync BOOLEAN NOT NULL DEFAULT 0"))
+        # Deliberately NOT creating the unique index on candles, and NOT
+        # relaxing orders.stop_loss -- both v1 and v2 are actually incomplete.
+
+    assert current_schema_version(engine) == 0  # stop_loss still NOT NULL -> v1 itself isn't satisfied either
+
+    report = run_migrations(engine)
+    assert report.applied == [1, 2]
+    with engine.connect() as conn:
+        assert conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type='index' AND name='uq_candle_symbol_timeframe_open_time'")
+        ).fetchone() is not None
+
+
+def test_is_close_present_but_stop_loss_still_not_null_is_detected_as_v0(tmp_path):
+    """orders.is_close existing is not enough on its own -- if
+    orders.stop_loss is still NOT NULL, v1 is not actually satisfied."""
+    engine = _make_legacy_v0_engine(tmp_path, name="partial_v1_notnull.db")
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE system_state ADD COLUMN state_ambiguous BOOLEAN NOT NULL DEFAULT 0"))
+        conn.execute(text("ALTER TABLE orders ADD COLUMN is_close BOOLEAN NOT NULL DEFAULT 0"))
+        # stop_loss is untouched -- still NOT NULL from the v0 schema.
+
+    assert current_schema_version(engine) == 0
+
+    report = run_migrations(engine)
+    assert report.applied == [1, 2]
+    with engine.connect() as conn:
+        assert conn.execute(text(
+            "INSERT INTO orders (idempotency_key, risk_evaluation_id, symbol, side, qty, stop_loss, "
+            "take_profit, is_close, status, exchange_order_id, mode, created_at, updated_at) "
+            "VALUES ('k2',1,'BTCUSDT','SELL',0.001,NULL,NULL,1,'FILLED','EX-2','PAPER_LOCAL',:t,:t)"
+        ), {"t": _now_iso()})
+
+
+def test_recorded_v2_with_missing_index_raises_schema_divergence_error(tmp_path):
+    """schema_migrations claiming v2 was applied, while the candles unique
+    index is actually absent, must stop safely rather than silently
+    trusting the recorded history."""
+    engine = _make_legacy_v0_engine(tmp_path, name="diverged.db")
+    run_migrations(engine)  # brings it to a real, consistent v2
+
+    # Now sabotage it: drop the unique index by hand, simulating either a
+    # manual change or an earlier bug that recorded success incorrectly.
+    with engine.begin() as conn:
+        conn.execute(text("DROP INDEX uq_candle_symbol_timeframe_open_time"))
+
+    with pytest.raises(SchemaDivergenceError) as excinfo:
+        run_migrations(engine)
+    assert "divergência" in str(excinfo.value).lower() or "inconsistência" in str(excinfo.value).lower()
+
+    # No further schema/data change happened as a side effect of detecting this.
+    with engine.connect() as conn:
+        migration_rows = conn.execute(text("SELECT version FROM schema_migrations ORDER BY version")).fetchall()
+        assert [r[0] for r in migration_rows] == [1, 2]  # unchanged from before the sabotage
+
+
+def test_differently_named_unique_index_still_satisfies_the_invariant(tmp_path):
+    """The structural check must match by COLUMNS, not by a hardcoded index
+    name -- an index some other tool created with a different name, but the
+    same uniqueness guarantee, must count."""
+    engine = _make_legacy_v0_engine(tmp_path, name="renamed_index.db")
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE system_state ADD COLUMN state_ambiguous BOOLEAN NOT NULL DEFAULT 0"))
+        conn.execute(text("ALTER TABLE system_state ADD COLUMN clock_out_of_sync BOOLEAN NOT NULL DEFAULT 0"))
+        conn.execute(text(
+            "CREATE TABLE orders_tmp (id INTEGER PRIMARY KEY AUTOINCREMENT, idempotency_key VARCHAR(128) NOT NULL, "
+            "risk_evaluation_id INTEGER NOT NULL, symbol VARCHAR(32) NOT NULL, side VARCHAR(8) NOT NULL, "
+            "qty FLOAT NOT NULL, stop_loss FLOAT, take_profit FLOAT, is_close BOOLEAN NOT NULL DEFAULT 0, "
+            "status VARCHAR(16) NOT NULL, exchange_order_id VARCHAR(128), mode VARCHAR(16) NOT NULL, "
+            "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+        ))
+        conn.execute(text(
+            "INSERT INTO orders_tmp SELECT id, idempotency_key, risk_evaluation_id, symbol, side, qty, "
+            "stop_loss, take_profit, 0, status, exchange_order_id, mode, created_at, updated_at FROM orders"
+        ))
+        conn.execute(text("DROP TABLE orders"))
+        conn.execute(text("ALTER TABLE orders_tmp RENAME TO orders"))
+        # Unique index with a totally different, non-standard name.
+        conn.execute(text(
+            "CREATE UNIQUE INDEX minha_constraint_customizada ON candles (symbol, timeframe, open_time)"
+        ))
+
+    assert current_schema_version(engine) == 2
+
+    report = run_migrations(engine)
+    assert report.applied == []  # already fully v2, nothing to do -- and no divergence error
+
+
+def test_fully_current_database_is_idempotent_under_strict_invariant_checking(tmp_path):
+    engine = _make_legacy_v0_engine(tmp_path, name="already_current.db")
+    run_migrations(engine)
+    report_again = run_migrations(engine)
+    assert report_again.applied == []
+    assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION

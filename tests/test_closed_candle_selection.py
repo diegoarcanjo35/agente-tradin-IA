@@ -32,7 +32,7 @@ def test_newest_first_response_with_open_then_closed_selects_the_closed_one():
 
     provider = BybitDemoMarketDataProvider(
         "https://api-demo.bybit.com", "BTCUSDT", "1",
-        http_get=fake_get, sleep=lambda s: None, now_fn=lambda: fixed_now, fetch_limit=5,
+        http_get=fake_get, sleep=lambda s: None, now_fn=lambda: fixed_now, page_size=5,
     )
 
     result = provider.next_candle()
@@ -66,7 +66,7 @@ def test_never_returns_only_a_forming_candle_across_repeated_polls():
 
     provider = BybitDemoMarketDataProvider(
         "https://api-demo.bybit.com", "BTCUSDT", "1",
-        http_get=fake_get, sleep=lambda s: None, now_fn=lambda: next(call_times), fetch_limit=5,
+        http_get=fake_get, sleep=lambda s: None, now_fn=lambda: next(call_times), page_size=5,
     )
 
     first = provider.next_candle()
@@ -92,7 +92,7 @@ def test_three_pending_closed_candles_are_delivered_once_each_in_chronological_o
 
     provider = BybitDemoMarketDataProvider(
         "https://api-demo.bybit.com", "BTCUSDT", "1",
-        http_get=fake_get, sleep=lambda s: None, now_fn=lambda: fixed_now, fetch_limit=5,
+        http_get=fake_get, sleep=lambda s: None, now_fn=lambda: fixed_now, page_size=5,
     )
 
     delivered = []
@@ -120,7 +120,7 @@ def test_minute_turnover_before_and_after_closure():
     # Before closure: 12:00 started 10s ago, not closed yet.
     provider = BybitDemoMarketDataProvider(
         "https://api-demo.bybit.com", "BTCUSDT", "1", http_get=fake_get,
-        sleep=lambda s: None, now_fn=lambda: open_1200 + timedelta(seconds=10), fetch_limit=5,
+        sleep=lambda s: None, now_fn=lambda: open_1200 + timedelta(seconds=10), page_size=5,
     )
     before = provider.next_candle()
     assert before.status == CandleFetchStatus.NO_NEW_CANDLE

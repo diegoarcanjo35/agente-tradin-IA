@@ -132,13 +132,30 @@ isso:
    `tests/test_bind_protection.py::test_launcher_passes_validated_settings_host_and_port_to_uvicorn`.
    Documentação e README instruem a nunca iniciar por outro caminho.
 2. **Autenticação da API de controle**, independente de como o servidor foi
-   iniciado: ativar o bloqueio de emergência nunca exige autenticação (só
-   aumenta a segurança); desativá-lo exige origem local
-   (`127.0.0.1`/`::1`) **ou** o cabeçalho `X-Control-Token` batendo com
-   `CONTROL_API_TOKEN` (comparação seguindo `hmac.compare_digest`). Sem
-   token configurado, qualquer origem não local é negada por padrão —
-   nunca liberado por omissão. Ver
-   `app/api/routes_control.py::require_local_or_authenticated` e
+   iniciado. Política final (correção v1.4 #4, depois de uma versão
+   anterior exigir token mesmo localmente e travar o próprio painel):
+   - **Ativar** o bloqueio de emergência nunca exige autenticação — só
+     aumenta a segurança.
+   - **Desativar** LOCALMENTE (`request.client.host` em `127.0.0.1`/`::1`)
+     sempre funciona, **com ou sem** `CONTROL_API_TOKEN` configurado. O
+     painel local nunca envia nem precisa conhecer o token
+     (`tests/test_bind_protection.py::test_frontend_never_sends_or_embeds_the_control_token`).
+   - **Desativar remotamente** exige o cabeçalho `X-Control-Token` batendo
+     com `CONTROL_API_TOKEN` (comparação com `hmac.compare_digest`). Sem
+     token configurado, origem não local é negada por padrão.
+   - A origem confiável é **sempre** `request.client.host` — o endereço do
+     socket TCP que o servidor ASGI realmente aceitou. Cabeçalhos como
+     `X-Forwarded-For`/`X-Real-IP`/`X-Forwarded-Host` **nunca** são
+     consultados para essa decisão, então não podem ser forjados por um
+     cliente remoto para se passar por local
+     (`tests/test_bind_protection.py::test_spoofed_forwarded_headers_alone_never_grant_access`).
+     Atrás de um proxy reverso, `request.client.host` será o endereço do
+     próprio proxy — configure `CONTROL_API_TOKEN` nesse cenário; esta fase
+     não implementa uma lista de proxies confiáveis para repassar cabeçalho
+     de origem.
+   - `request.client` ausente é tratado como não confiável (negado), nunca
+     como bypass implícito.
+   Ver `app/api/routes_control.py::require_local_or_authenticated` e
    `tests/test_bind_protection.py`.
 
 Uma implementação completa de autenticação para todos os endpoints (não só

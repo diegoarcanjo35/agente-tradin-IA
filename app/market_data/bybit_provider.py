@@ -60,16 +60,24 @@ class BybitDemoMarketDataProvider:
     also never hands back a candle that (a) is the same one already
     returned, or (b) is still forming (its period hasn't fully elapsed yet).
 
-    Correction v1.3 #2: Bybit's kline endpoint returns rows newest-first,
-    and the most recent one is very often still forming. Polling with
-    `limit=1` can therefore return only an open candle over and over,
-    leaving the last CLOSED candle permanently outside the response window
-    and never delivered to the strategy. `fetch_limit` (default 5) requests
-    enough history that at least one closed, not-yet-processed candle is
-    normally present; every call parses the whole batch, keeps only closed
-    and not-yet-processed rows, and returns the OLDEST of those -- so a run
-    of several pending closed candles (e.g. after a period of failures) is
-    drained one at a time, in chronological order, with no gaps.
+    Correction v1.4 #2: a single request with a small, fixed `limit` can
+    never guarantee draining an arbitrarily large backlog of pending closed
+    candles -- some of them would be permanently outside the response
+    window. `next_candle()` instead maintains an internal FIFO of pending
+    closed candles (`_pending_queue`), refilled by `_refill_queue()`, which
+    PAGINATES forward from the last processed candle using Bybit's `start`
+    parameter (never assuming the whole backlog fits in one response),
+    walking strictly chronologically, until it catches up to the present or
+    hits `max_pages_per_poll` (a per-poll safety cap, not a hard ceiling on
+    how much backlog can ever be drained -- the next poll simply continues
+    paginating from where this one left off). The cursor
+    (`_last_processed_open_time`) only ever advances as candles are actually
+    DELIVERED to the caller via `next_candle()`, not merely fetched, so a
+    mid-pagination failure never loses already-confirmed progress and never
+    creates a duplicate. `sync_cursor()` lets the orchestrator inform a
+    freshly constructed provider (e.g. after a process restart) of the last
+    candle actually persisted to the database, so draining resumes exactly
+    where it left off instead of restarting or losing track.
     """
 
     def __init__(
@@ -80,7 +88,8 @@ class BybitDemoMarketDataProvider:
         http_get: Callable[[str, dict], dict],
         sleep: Callable[[float], None] = time.sleep,
         now_fn: Callable[[], datetime] = utcnow,
-        fetch_limit: int = 5,
+        page_size: int = 200,
+        max_pages_per_poll: int = 10,
     ):
         assert_demo_host(base_url)
         self.base_url = base_url
@@ -89,12 +98,25 @@ class BybitDemoMarketDataProvider:
         self._http_get = http_get
         self._sleep = sleep
         self._now_fn = now_fn
-        self._fetch_limit = fetch_limit
+        self._page_size = page_size
+        self._max_pages_per_poll = max_pages_per_poll
         self._interval_duration = parse_bybit_interval_to_timedelta(timeframe)
         self._backoff = BackoffPolicy()
         self._last_received_at: datetime | None = None
         self._last_processed_open_time: datetime | None = None
         self._consecutive_failures = 0
+        self._pending_queue: list[CandleTick] = []
+        self._pending_gap: tuple[datetime, datetime] | None = None
+
+    def sync_cursor(self, persisted_open_time: datetime | None) -> None:
+        """Correction v1.4 #2: called by the orchestrator with the most
+        recent candle already persisted for this symbol/timeframe. Only
+        ever moves the cursor FORWARD -- never rewinds progress this
+        provider instance already made on its own."""
+        if persisted_open_time is None:
+            return
+        if self._last_processed_open_time is None or persisted_open_time > self._last_processed_open_time:
+            self._last_processed_open_time = persisted_open_time
 
     def _parse_row(self, row: list, received_at: datetime) -> tuple[datetime, CandleTick]:
         # Bybit kline rows: [start, open, high, low, close, volume, turnover]
@@ -114,54 +136,146 @@ class BybitDemoMarketDataProvider:
         return open_time, candle
 
     def next_candle(self) -> CandleFetchResult:
-        try:
-            resp = self._http_get(
-                f"{self.base_url}/v5/market/kline",
-                {
-                    "category": "linear", "symbol": self.symbol,
-                    "interval": self.timeframe, "limit": self._fetch_limit,
-                },
-            )
-            self._backoff.reset()
-            self._consecutive_failures = 0
-        except (ExchangeTimeoutError, RateLimitError) as exc:
-            self._consecutive_failures += 1
-            delay = self._backoff.next_delay()
-            log_event(logger, 30, "market_data_fetch_failed", error=str(exc), retry_in=delay,
-                      consecutive_failures=self._consecutive_failures)
-            self._sleep(delay)
+        if self._pending_queue:
+            return self._pop_from_queue()
+
+        error_result = self._refill_queue()
+        if error_result is not None:
+            return error_result
+
+        if self._pending_queue:
+            return self._pop_from_queue()
+
+        if self._pending_gap is not None:
+            expected, found = self._pending_gap
+            self._pending_gap = None
             return CandleFetchResult(
-                status=CandleFetchStatus.RETRYABLE_ERROR,
-                detail=f"Falha temporária ao consultar dados de mercado da Bybit: {exc}",
+                status=CandleFetchStatus.GAP_DETECTED,
+                detail=(
+                    f"Lacuna detectada na sequência de candles fechados de {self.symbol}: "
+                    f"esperava o candle de {expected.isoformat()}, mas o próximo disponível na "
+                    f"corretora é {found.isoformat()}. Intervenção manual pode ser necessária "
+                    f"(ver docs/OPERACAO_DEMO.md)."
+                ),
             )
 
-        rows = resp.get("result", {}).get("list", [])
-        if not rows:
-            return CandleFetchResult(status=CandleFetchStatus.NO_NEW_CANDLE)
+        return CandleFetchResult(status=CandleFetchStatus.NO_NEW_CANDLE)
 
-        now = self._now_fn()
-        parsed = [self._parse_row(row, now) for row in rows]  # order not assumed (newest-first per Bybit)
-
-        pending_closed = [
-            (open_time, candle) for open_time, candle in parsed
-            if now >= open_time + self._interval_duration
-            and (self._last_processed_open_time is None or open_time > self._last_processed_open_time)
-        ]
-        if not pending_closed:
-            return CandleFetchResult(status=CandleFetchStatus.NO_NEW_CANDLE)
-
-        pending_closed.sort(key=lambda pair: pair[0])
-        open_time, candle = pending_closed[0]  # oldest pending closed candle first -- never skip ahead
-
+    def _pop_from_queue(self) -> CandleFetchResult:
+        candle = self._pending_queue.pop(0)
         received_at = utcnow()
         self._last_received_at = received_at
-        self._last_processed_open_time = open_time
-        candle = CandleTick(
+        self._last_processed_open_time = candle.open_time
+        delivered = CandleTick(
             symbol=candle.symbol, timeframe=candle.timeframe, open_time=candle.open_time,
             open=candle.open, high=candle.high, low=candle.low, close=candle.close,
             volume=candle.volume, source=candle.source, received_at=received_at,
         )
-        return CandleFetchResult(status=CandleFetchStatus.CANDLE_AVAILABLE, candle=candle)
+        return CandleFetchResult(status=CandleFetchStatus.CANDLE_AVAILABLE, candle=delivered)
+
+    def _refill_queue(self) -> CandleFetchResult | None:
+        """Paginates forward from the cursor, collecting every pending
+        CLOSED candle it can find (up to `max_pages_per_poll` pages), and
+        enqueues them in chronological order. Returns a CandleFetchResult
+        only for an immediate short-circuit (RETRYABLE_ERROR/GAP_DETECTED
+        with nothing usable collected yet); returns None once anything is
+        queued (including "queued some, then hit an error/gap") so the
+        caller drains the queue first and reports the problem afterward,
+        keeping the API call boundary at exactly one candle per
+        `next_candle()` call.
+        """
+        collected: list[CandleTick] = []
+        cursor = self._last_processed_open_time
+        pages = 0
+
+        while pages < self._max_pages_per_poll:
+            params = {
+                "category": "linear", "symbol": self.symbol,
+                "interval": self.timeframe, "limit": self._page_size,
+            }
+            if cursor is not None:
+                params["start"] = int((cursor + self._interval_duration).timestamp() * 1000)
+
+            try:
+                resp = self._http_get(f"{self.base_url}/v5/market/kline", params)
+                self._backoff.reset()
+                self._consecutive_failures = 0
+            except (ExchangeTimeoutError, RateLimitError) as exc:
+                self._consecutive_failures += 1
+                delay = self._backoff.next_delay()
+                log_event(logger, 30, "market_data_fetch_failed", error=str(exc), retry_in=delay,
+                          consecutive_failures=self._consecutive_failures, page=pages)
+                self._sleep(delay)
+                if collected:
+                    break  # keep the real progress already made this poll
+                return CandleFetchResult(
+                    status=CandleFetchStatus.RETRYABLE_ERROR,
+                    detail=f"Falha temporária ao consultar dados de mercado da Bybit: {exc}",
+                )
+
+            rows = resp.get("result", {}).get("list", [])
+            if not rows:
+                break
+
+            now = self._now_fn()
+            parsed = sorted((self._parse_row(row, now) for row in rows), key=lambda p: p[0])
+            closed = [p for p in parsed if now >= p[0] + self._interval_duration]
+            new_closed = [p for p in closed if cursor is None or p[0] > cursor]
+
+            if not new_closed:
+                break
+
+            # Walk the candidates in order, accepting each only if it is
+            # EXACTLY one interval after the previous one accepted (or, for
+            # the very first candle ever -- cursor is None -- accepting it
+            # unconditionally as the new baseline, since there is no prior
+            # reference to detect a gap against). The first place this
+            # breaks down, if any, is a genuine hole in the sequence -- not
+            # just "the boundary between this page and the previous one".
+            usable: list[tuple[datetime, CandleTick]] = []
+            gap: tuple[datetime, datetime] | None = None
+            prev = cursor
+            for open_time, candle in new_closed:
+                if prev is not None:
+                    expected = prev + self._interval_duration
+                    if open_time != expected:
+                        gap = (expected, open_time)
+                        break
+                usable.append((open_time, candle))
+                prev = open_time
+
+            if not usable:
+                # The very first candidate already fails to match the
+                # cursor's expected next interval.
+                if collected:
+                    self._pending_gap = gap
+                    break
+                return CandleFetchResult(
+                    status=CandleFetchStatus.GAP_DETECTED,
+                    detail=(
+                        f"Lacuna detectada na sequência de candles fechados de {self.symbol}: "
+                        f"esperava o candle de {gap[0].isoformat()}, mas o próximo disponível na "
+                        f"corretora é {gap[1].isoformat()}."
+                    ),
+                )
+
+            collected.extend(candle for _open_time, candle in usable)
+            cursor = usable[-1][0]
+
+            if gap is not None:
+                # Got some real, contiguous progress before hitting the
+                # hole -- keep it, and surface the gap right after it's
+                # drained instead of discarding confirmed candles.
+                self._pending_gap = gap
+                break
+
+            if len(rows) < self._page_size:
+                break  # short page: caught up to whatever the exchange has right now
+            pages += 1
+
+        if collected:
+            self._pending_queue.extend(collected)
+        return None
 
     def is_stale(self, max_staleness_seconds: float) -> bool:
         if self._last_received_at is None:

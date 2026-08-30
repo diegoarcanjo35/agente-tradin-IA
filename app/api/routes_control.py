@@ -1,7 +1,7 @@
 """Control endpoints. Deliberately does NOT include any mode/environment
 toggle -- mode is process-level config only (see app/core/config.py).
 
-Correction v1.3 #3 (opções B+C combinadas): a validação de
+Correction v1.3 #3 / v1.4 #4 (opções B+C combinadas): a validação de
 `Settings.api_host` só é confiável quando o processo foi iniciado pelo
 launcher oficial (`app/run.py`) -- um `uvicorn app.api.main:app --host
 0.0.0.0` direto contorna completamente esse controle, e a aplicação não tem
@@ -11,10 +11,22 @@ segunda camada, independente de como o servidor foi iniciado:
 - ATIVAR o bloqueio de emergência nunca exige autenticação -- é uma ação que
   só aumenta a segurança, então liberá-la de qualquer origem é seguro
   (opção C: "permitir ativar pela interface").
-- DESATIVAR o bloqueio de emergência (liberar operações) exige que a
-  requisição seja local (127.0.0.1/::1) OU apresente `X-Control-Token`
-  batendo com `CONTROL_API_TOKEN` (opção B, com negação por padrão quando
-  nenhum token está configurado e a origem não é local).
+- DESATIVAR o bloqueio de emergência (liberar operações) LOCALMENTE
+  (127.0.0.1/::1) sempre funciona, COM ou SEM `CONTROL_API_TOKEN`
+  configurado -- correção v1.4 #4: uma versão anterior exigia o token
+  mesmo para requisições locais assim que ele era configurado, o que
+  quebrava o próprio painel local ao ativar a proteção para acesso remoto.
+  O painel nunca precisa (nem deve) conhecer o token.
+- DESATIVAR remotamente exige `X-Control-Token` batendo com
+  `CONTROL_API_TOKEN`; sem token configurado, acesso remoto é negado por
+  padrão.
+- A origem é sempre `request.client.host`, o endereço do socket TCP que o
+  servidor ASGI realmente aceitou -- nunca um cabeçalho como
+  `X-Forwarded-For`/`X-Real-IP`, que qualquer cliente pode forjar. Atrás de
+  um proxy reverso, `request.client.host` será o endereço do PRÓPRIO proxy,
+  não do usuário final; nesse cenário configure `CONTROL_API_TOKEN` -- não
+  há aqui nenhuma lista de proxies confiáveis para repassar cabeçalhos de
+  origem.
 """
 from __future__ import annotations
 
@@ -32,31 +44,37 @@ LOCAL_CLIENT_HOSTS = frozenset({"127.0.0.1", "::1", "testclient"})
 
 def require_local_or_authenticated(request: Request) -> None:
     """Dependency guarding any control action that REDUCES safety (i.e.
-    releases operations). Denies by default: with no CONTROL_API_TOKEN
-    configured, only a local client is allowed through."""
-    settings = request.app.state.settings
+    releases operations).
+
+    Policy (correction v1.4 #4): a LOCAL client is always allowed, whether
+    or not CONTROL_API_TOKEN is configured -- configuring the token
+    protects remote access; it must never lock out the local panel. A
+    non-local client is denied unless it presents the correct token; with
+    no token configured at all, remote access is denied outright (deny by
+    default, never silently open).
+    """
     client_host = request.client.host if request.client is not None else None
-    token = getattr(settings, "control_api_token", "") or ""
-
-    if token:
-        provided = request.headers.get("X-Control-Token", "")
-        if hmac.compare_digest(provided, token):
-            return
-        raise HTTPException(
-            status_code=403,
-            detail="Token de controle inválido ou ausente. Desativação recusada.",
-        )
-
     if client_host in LOCAL_CLIENT_HOSTS:
         return
 
+    settings = request.app.state.settings
+    token = getattr(settings, "control_api_token", "") or ""
+    if not token:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Acesso negado: nenhum CONTROL_API_TOKEN configurado e a requisição não "
+                "é local. Desativar o bloqueio de emergência remotamente exige um token "
+                "de controle configurado via CONTROL_API_TOKEN."
+            ),
+        )
+
+    provided = request.headers.get("X-Control-Token", "")
+    if hmac.compare_digest(provided, token):
+        return
     raise HTTPException(
         status_code=403,
-        detail=(
-            "Acesso negado: nenhum CONTROL_API_TOKEN configurado e a requisição não "
-            "é local. Desativar o bloqueio de emergência remotamente exige um token "
-            "de controle configurado via CONTROL_API_TOKEN."
-        ),
+        detail="Token de controle inválido ou ausente. Desativação recusada.",
     )
 
 

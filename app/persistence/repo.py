@@ -93,6 +93,29 @@ def save_candle(session: Session, symbol: str, timeframe: str, open_time: dateti
     return c
 
 
+def get_last_candle_open_time(session: Session, symbol: str, timeframe: str) -> datetime | None:
+    """Correction v1.4 #2: the persistent cursor for backlog draining --
+    the last candle actually committed for this symbol+timeframe. Backed by
+    the `candles` table itself (already the source of truth, already
+    indexed) rather than a separate cursor table, so a fresh
+    BybitDemoMarketDataProvider instance (e.g. after a process restart) can
+    call `sync_cursor()` with this value and resume exactly where it left
+    off."""
+    row = session.execute(
+        select(Candle.open_time)
+        .where(Candle.symbol == symbol, Candle.timeframe == timeframe)
+        .order_by(Candle.open_time.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    # SQLite's DATETIME column round-trips as a naive datetime regardless of
+    # what was stored -- every timestamp in this app is UTC by convention
+    # (app.core.clock.utcnow()), so re-attach that explicitly rather than
+    # ever comparing naive vs. aware datetimes.
+    return row if row.tzinfo is not None else row.replace(tzinfo=timezone.utc)
+
+
 def save_signal(session: Session, symbol: str, direction: str, justification: str,
                  observed_price: float, atr: float, params: dict) -> StrategySignal:
     s = StrategySignal(

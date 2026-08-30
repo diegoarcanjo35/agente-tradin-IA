@@ -64,6 +64,18 @@ class Orchestrator:
         with session_scope(self.session_factory) as session:
             state = repo.get_or_create_system_state(session)
 
+            # Correction v1.4 #2: before polling, tell the provider the last
+            # candle actually persisted for its symbol/timeframe -- cheap
+            # (indexed) and makes a freshly constructed provider (e.g. right
+            # after a process restart) resume backlog draining exactly where
+            # it left off, never reprocessing or losing track.
+            sync_cursor = getattr(self.market_data_provider, "sync_cursor", None)
+            if sync_cursor is not None:
+                provider_symbol = getattr(self.market_data_provider, "symbol", self.settings.symbol)
+                provider_timeframe = getattr(self.market_data_provider, "timeframe", "1")
+                persisted_open_time = repo.get_last_candle_open_time(session, provider_symbol, provider_timeframe)
+                sync_cursor(persisted_open_time)
+
             fetch_result = self.market_data_provider.next_candle()
 
             if fetch_result.status == CandleFetchStatus.REPLAY_FINISHED:
@@ -92,6 +104,20 @@ class Orchestrator:
                 repo.record_failure(session, "FAILURE", detail)
                 repo.record_security_event(session, "FATAL_MARKET_DATA_ERROR", detail)
                 return {"status": "fatal_error", "detail": detail}
+
+            if fetch_result.status == CandleFetchStatus.GAP_DETECTED:
+                # Correction v1.4 #2: an unrecoverable hole in the closed-
+                # candle sequence is treated as an explicit, safe state --
+                # never silently skipped over. Blocks trading like any other
+                # data-integrity problem; does NOT end the polling loop
+                # (only REPLAY_FINISHED does), so the operator can resolve
+                # it and the process keeps observing without a restart.
+                state.state_ambiguous = True
+                repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
+                detail = fetch_result.detail or "Lacuna detectada na sequência de candles fechados."
+                repo.record_failure(session, "FAILURE", detail)
+                repo.record_security_event(session, "MARKET_DATA_GAP_DETECTED", detail)
+                return {"status": "gap_detected", "detail": detail}
 
             candle = fetch_result.candle
             saved = repo.save_candle(

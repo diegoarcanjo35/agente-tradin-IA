@@ -57,6 +57,17 @@ class MigrationError(Exception):
     operator starting the app against an old database."""
 
 
+class SchemaDivergenceError(MigrationError):
+    """Correction v1.4 #3: raised when `schema_migrations` records a
+    version as applied, but the real schema does not actually satisfy that
+    version's invariants (e.g. someone dropped an index by hand, or an
+    older bug recorded success without actually altering everything). The
+    system refuses to guess or silently "repair" this -- it stops safely
+    and asks for manual intervention, since automatically altering a
+    database in an already-unknown state risks making a real corruption
+    worse or masking it."""
+
+
 @dataclass(frozen=True)
 class MigrationReport:
     starting_version: int
@@ -77,11 +88,33 @@ def _column_exists(conn: Connection, table: str, column: str) -> bool:
     return any(r[1] == column for r in rows)
 
 
-def _index_exists(conn: Connection, index_name: str) -> bool:
-    row = conn.execute(
-        text("SELECT name FROM sqlite_master WHERE type='index' AND name=:n"), {"n": index_name}
-    ).fetchone()
-    return row is not None
+def _column_is_nullable(conn: Connection, table: str, column: str) -> bool:
+    """False if the column doesn't exist OR is NOT NULL; True only if it
+    exists and genuinely accepts NULL."""
+    rows = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+    for row in rows:
+        # PRAGMA table_info columns: (cid, name, type, notnull, dflt_value, pk)
+        if row[1] == column:
+            return row[3] == 0
+    return False
+
+
+def _has_unique_index_on(conn: Connection, table: str, columns: set[str]) -> bool:
+    """True if SOME unique index exists on `table` covering exactly
+    `columns` -- matched by structure (the set of indexed columns), never by
+    a hardcoded index name, so a differently-named index providing the same
+    guarantee still counts (correction v1.4 #3)."""
+    index_list = conn.execute(text(f"PRAGMA index_list({table})")).fetchall()
+    for index_row in index_list:
+        # PRAGMA index_list columns: (seq, name, unique, origin, partial)
+        index_name, is_unique = index_row[1], index_row[2]
+        if not is_unique:
+            continue
+        index_info = conn.execute(text(f"PRAGMA index_info({index_name})")).fetchall()
+        indexed_columns = {r[2] for r in index_info}  # (seqno, cid, name)
+        if indexed_columns == columns:
+            return True
+    return False
 
 
 def _ensure_schema_migrations_table(conn: Connection) -> None:
@@ -113,7 +146,16 @@ def _migrate_to_v1(conn: Connection) -> None:
             "ALTER TABLE system_state ADD COLUMN state_ambiguous BOOLEAN NOT NULL DEFAULT 0"
         ))
 
-    needs_orders_rebuild = not _column_exists(conn, "orders", "is_close")
+    # Correction v1.4 #3: a database can have `is_close` already added by
+    # some other means (or a prior partial/aborted attempt) while
+    # `stop_loss` is STILL NOT NULL -- checking only the column's presence
+    # missed that case entirely and left a database silently stuck without
+    # a nullable stop_loss forever. Rebuild whenever EITHER invariant of
+    # the target shape is not yet met.
+    needs_orders_rebuild = (
+        not _column_exists(conn, "orders", "is_close")
+        or not _column_is_nullable(conn, "orders", "stop_loss")
+    )
     if needs_orders_rebuild:
         # SQLite cannot drop a NOT NULL constraint (orders.stop_loss) with a
         # plain ALTER TABLE, and orders.is_close is a new column -- both are
@@ -139,11 +181,16 @@ def _migrate_to_v1(conn: Connection) -> None:
             "updated_at DATETIME NOT NULL"
             ")"
         ))
+        # Preserve real is_close values if the column already existed on the
+        # source table (e.g. a partially-migrated database); default new
+        # rows to 0 (opening order) only when the column didn't exist yet.
+        is_close_source_expr = "is_close" if _column_exists(conn, "orders", "is_close") else "0"
         conn.execute(text(
             "INSERT INTO orders_v1 (id, idempotency_key, risk_evaluation_id, symbol, side, qty, "
             "stop_loss, take_profit, is_close, status, exchange_order_id, mode, created_at, updated_at) "
-            "SELECT id, idempotency_key, risk_evaluation_id, symbol, side, qty, "
-            "stop_loss, take_profit, 0, status, exchange_order_id, mode, created_at, updated_at "
+            f"SELECT id, idempotency_key, risk_evaluation_id, symbol, side, qty, "
+            f"stop_loss, take_profit, {is_close_source_expr}, status, exchange_order_id, mode, "
+            f"created_at, updated_at "
             "FROM orders"
         ))
         conn.execute(text("DROP TABLE orders"))
@@ -161,7 +208,7 @@ def _migrate_to_v2(conn: Connection) -> None:
             "ALTER TABLE system_state ADD COLUMN clock_out_of_sync BOOLEAN NOT NULL DEFAULT 0"
         ))
 
-    if not _index_exists(conn, "uq_candle_symbol_timeframe_open_time"):
+    if not _has_unique_index_on(conn, "candles", {"symbol", "timeframe", "open_time"}):
         # Deterministic, documented dedup strategy (required by the
         # correction): for any (symbol, timeframe, open_time) group with
         # more than one row, keep only the row with the lowest id (the
@@ -185,14 +232,59 @@ MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
 ]
 
 
+def _v1_invariants_satisfied(conn: Connection) -> bool:
+    """ALL structural invariants of v1 -- not just one sentinel column
+    (correction v1.4 #3). A database only counts as "at least v1" if every
+    one of these holds."""
+    return (
+        _column_exists(conn, "system_state", "state_ambiguous")
+        and _column_exists(conn, "orders", "is_close")
+        and _column_is_nullable(conn, "orders", "stop_loss")
+    )
+
+
+def _v2_invariants_satisfied(conn: Connection) -> bool:
+    """ALL structural invariants of v2. The unique index check is
+    structural (by columns), so an index with a different name providing
+    the same guarantee still satisfies it."""
+    return (
+        _column_exists(conn, "system_state", "clock_out_of_sync")
+        and _has_unique_index_on(conn, "candles", {"symbol", "timeframe", "open_time"})
+    )
+
+
+_VERSION_INVARIANTS: dict[int, Callable[[Connection], bool]] = {
+    1: _v1_invariants_satisfied,
+    2: _v2_invariants_satisfied,
+}
+
+
+def _invariants_satisfied_for_version(conn: Connection, version: int) -> bool:
+    check = _VERSION_INVARIANTS.get(version)
+    return check(conn) if check is not None else True
+
+
 def _detect_legacy_version(conn: Connection) -> int:
     """For a database with tables but no schema_migrations history yet,
-    inspects actual columns to determine which baseline it already matches."""
-    if not _column_exists(conn, "system_state", "state_ambiguous"):
+    validates ALL structural invariants of each version (never a single
+    sentinel column) to determine which baseline it already matches."""
+    if not _v1_invariants_satisfied(conn):
         return 0
-    if not _column_exists(conn, "system_state", "clock_out_of_sync"):
+    if not _v2_invariants_satisfied(conn):
         return 1
     return 2
+
+
+def _find_diverged_version(conn: Connection, recorded_versions: set[int]) -> int | None:
+    """Correction v1.4 #3: schema_migrations recording a version as applied
+    is not, by itself, trusted -- every recorded version's invariants are
+    re-checked against the REAL schema every run. Returns the lowest
+    recorded version whose invariants do not actually hold, or None if
+    every recorded version checks out."""
+    for version in sorted(recorded_versions):
+        if not _invariants_satisfied_for_version(conn, version):
+            return version
+    return None
 
 
 def current_schema_version(engine: Engine) -> int:
@@ -216,6 +308,20 @@ def run_migrations(engine: Engine) -> MigrationReport:
             _ensure_schema_migrations_table(conn)
             already_applied = _applied_versions(conn)
             starting_version = max(already_applied) if already_applied else None
+
+            if already_applied:
+                diverged = _find_diverged_version(conn, already_applied)
+                if diverged is not None:
+                    raise SchemaDivergenceError(
+                        f"Inconsistência de esquema detectada: schema_migrations registra a "
+                        f"versão v{diverged} como aplicada, mas o esquema real do banco não "
+                        f"satisfaz todos os invariantes estruturais dessa versão (colunas, "
+                        f"nulabilidade ou índices únicos ausentes/divergentes). Isso pode "
+                        f"indicar uma migração anterior malsucedida, uma alteração manual do "
+                        f"banco, ou corrupção. Por segurança, nenhuma alteração automática foi "
+                        f"feita -- intervenção manual é necessária antes de reiniciar a "
+                        f"aplicação. Ver docs/MIGRACOES.md, seção 'Divergência de esquema'."
+                    )
 
             brand_new = not _table_exists(conn, "system_state")
             if brand_new:

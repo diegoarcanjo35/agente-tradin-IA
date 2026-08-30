@@ -87,19 +87,50 @@ constraint única (`symbol, timeframe, open_time`) como defesa adicional —
 apenas retorna `None` e a tick é ignorada sem criar sinal/IA/avaliação de
 risco duplicados.
 
-### Seleção do candle fechado anterior (correção v1.3 #2)
+### Seleção do candle fechado anterior e paginação do backlog (correções v1.3 #2 e v1.4 #2)
 
 A Bybit retorna as linhas de kline **da mais nova para a mais antiga**, e a
-mais nova é frequentemente um candle ainda em formação. Consultar com
-`limit=1` podia devolver só esse candle aberto repetidamente, deixando o
-candle fechado anterior permanentemente fora da janela de resposta — o
-processo nunca entregava candle algum à estratégia. `BybitDemoMarketDataProvider`
-agora consulta `fetch_limit` linhas (padrão 5), interpreta todas
-(independente da ordem), filtra apenas as fechadas (`open_time + intervalo
-<= agora`) e ainda não processadas, e entrega sempre a **mais antiga
-pendente** — nunca pulando à frente. Se várias tiverem se acumulado (ex.:
-após um período de falhas), são drenadas uma por chamada, em ordem
-cronológica, sem lacunas. Coberto por `tests/test_closed_candle_selection.py`.
+mais nova é frequentemente um candle ainda em formação — consultar com
+`limit` fixo pequeno podia devolver só esse candle aberto repetidamente, ou
+(auditoria v1.4) perder candles fechados mais antigos que a janela de uma
+única resposta quando o backlog pendente era maior que o `limit` pedido.
+
+`BybitDemoMarketDataProvider` agora **pagina** para frente a partir de um
+cursor (`app/market_data/bybit_provider.py::_refill_queue`): consulta com
+`start = cursor + intervalo` e `limit = page_size` (padrão 200), interpreta
+todas as linhas recebidas (independente da ordem devolvida), aceita apenas
+as fechadas e ainda não processadas, e continua pedindo páginas seguintes
+(até `max_pages_per_poll`, padrão 10 — um limite de segurança por chamada,
+não um teto de quanto backlog pode ser drenado no total: a próxima chamada
+simplesmente continua de onde parou) até alcançar o presente. Candles são
+enfileirados internamente e entregues **um por `next_candle()`**, sempre em
+ordem cronológica.
+
+O cursor (`_last_processed_open_time`) só avança conforme candles são
+efetivamente **entregues** pelo provider, nunca apenas buscados — uma falha
+de rede no meio da paginação preserva o progresso já confirmado (os candles
+já obtidos ficam na fila) e a próxima tentativa continua exatamente do
+mesmo ponto, sem lacuna nem duplicata.
+
+**Cursor persistente**: a cada `tick()`, o `Orchestrator` consulta o
+`open_time` do último candle realmente persistido em `candles`
+(`repo.get_last_candle_open_time`) e chama `provider.sync_cursor(...)` antes
+de buscar o próximo candle. Isso significa que uma instância nova do
+provider — por exemplo depois de um reinício do processo — retoma a
+drenagem exatamente de onde parou, usando só o que está no banco, nunca
+duplicando nem perdendo candles já processados.
+
+**Lacuna irrecuperável**: se a sequência de candles fechados pular (o
+próximo candle disponível na corretora não é exatamente um intervalo após o
+cursor), o provider reporta `CandleFetchStatus.GAP_DETECTED` de forma
+explícita — nunca pula silenciosamente a lacuna. O `Orchestrator` marca
+`state_ambiguous=True` (bloqueando operações) e registra o evento, mas o
+loop de polling continua vivo (só `REPLAY_FINISHED` o encerra).
+
+Coberto por `tests/test_closed_candle_selection.py` (seleção básica) e
+`tests/test_candle_backlog_pagination.py` (backlog maior que uma página,
+ordem embaralhada, falha entre páginas, lacuna, reinício com cursor
+persistido).
 
 ## Testando o kill switch
 

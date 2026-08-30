@@ -234,7 +234,13 @@ def test_orchestrator_skips_signal_ai_and_risk_for_a_duplicate_candle(session_fa
 
     market_data_provider._last_processed_open_time = None  # simulate the provider forgetting
     second = orch.tick()
-    assert second["status"] == "duplicate_candle"
+    # Correction v1.4 #2: Orchestrator.tick() now re-syncs the provider's
+    # cursor from the persisted candle at the START of every tick, so the
+    # provider itself already refuses to re-deliver a candle that was
+    # actually saved -- "no_new_candle" is the (stronger) outcome now,
+    # instead of ever reaching the DB-level "duplicate_candle" guard. Either
+    # way, no duplicate signal/AI/risk row may be created -- checked below.
+    assert second["status"] in ("duplicate_candle", "no_new_candle")
 
     with session_scope(session_factory) as session:
         signals = repo.recent_signals(session, limit=100)

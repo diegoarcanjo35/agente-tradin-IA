@@ -30,6 +30,7 @@ class CandleFetchStatus(str, Enum):
     RETRYABLE_ERROR = "RETRYABLE_ERROR"  # timeout/rate limit -- backoff and keep polling
     REPLAY_FINISHED = "REPLAY_FINISHED"  # REPLAY fixture exhausted -- the only status that ends the loop
     FATAL_ERROR = "FATAL_ERROR"  # unrecoverable provider misconfiguration
+    GAP_DETECTED = "GAP_DETECTED"  # correction v1.4 #2: a hole in the closed-candle sequence -- explicit, safe, blocks trading
 
 
 @dataclass(frozen=True)

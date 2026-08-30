@@ -45,7 +45,7 @@ nenhum passo manual em operação normal.
   migration 2.
 - **Banco já na v2**: nenhuma alteração; idempotente.
 
-## Transacionalidade e falha segura
+## Transacionalidade e falha segura (correção v1.4 #1)
 
 Toda a execução de `run_migrations()` ocorre dentro de **uma única
 transação** (`engine.begin()`). Se qualquer migration lançar exceção, a
@@ -55,6 +55,46 @@ transação inteira é revertida — nenhuma migration parcial é registrada em
 português explicando em qual versão o banco permaneceu. A aplicação não
 inicia (o erro propaga até `build_orchestrator()`), em vez de seguir
 silenciosamente contra um esquema desatualizado.
+
+**Detalhe crítico do driver SQLite**: a biblioteca padrão `sqlite3` do
+Python, por padrão, não entrega DDL (`ALTER TABLE`, `CREATE INDEX`,
+`CREATE TABLE`) realmente transacional através do SQLAlchemy — o driver
+emite seu próprio `COMMIT` implícito ao redor dessas instruções,
+independente de uma transação SQLAlchemy estar aberta. Uma auditoria
+adversarial reproduziu exatamente isso: uma migration fazia um `ALTER
+TABLE` real e, em seguida, lançava exceção; o `ALTER` permanecia no banco
+mesmo com `MigrationError` levantado. A correção (`app/persistence/db.py::
+make_engine()`) desliga o gerenciamento de transação implícito do driver
+(`isolation_level = None`) e faz o próprio SQLAlchemy emitir um `BEGIN`
+explícito a cada transação — inclusive para DDL. Com isso, `engine.begin()`
+engloba `CREATE TABLE`/`ALTER TABLE`/`CREATE INDEX` exatamente como
+qualquer instrução DML, e uma falha posterior reverte tudo de verdade.
+Prova adversarial reproduzindo o cenário exato do auditor (ALTER real,
+depois falha, checagem de esquema E dados completos antes/depois):
+`tests/test_migrations.py::test_alter_table_add_column_is_rolled_back_on_later_failure`.
+
+## Divergência de esquema (correção v1.4 #3)
+
+`schema_migrations` registrar uma versão como aplicada não é, por si só,
+confiável — a cada execução, `run_migrations()` re-valida TODOS os
+invariantes estruturais de cada versão já registrada (não apenas uma coluna
+sentinela) contra o esquema real:
+
+- **v1**: `system_state.state_ambiguous` existe; `orders.is_close` existe;
+  `orders.stop_loss` aceita `NULL` (checado via `PRAGMA table_info`, não só
+  presença da coluna).
+- **v2**: `system_state.clock_out_of_sync` existe; existe algum índice
+  único sobre `candles(symbol, timeframe, open_time)` — identificado pela
+  **estrutura** (colunas cobertas), nunca por um nome fixo, então um índice
+  criado por outra ferramenta com nome diferente ainda conta.
+
+Se uma versão registrada não satisfizer integralmente seus invariantes, a
+aplicação **para com `SchemaDivergenceError`**, em português, e não altera
+nada automaticamente — reparo automático de um esquema já divergente foi
+considerado arriscado demais (poderia mascarar corrupção real). Nesse caso,
+inspecione manualmente o banco (`PRAGMA table_info`/`PRAGMA index_list`) e
+decida entre reparar manualmente o esquema para bater com a versão
+registrada, ou restaurar de um backup.
 
 ## Deduplicação de candles (migration 2)
 

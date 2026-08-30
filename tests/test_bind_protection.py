@@ -129,16 +129,51 @@ def test_require_local_or_authenticated_allows_external_client_with_correct_toke
     require_local_or_authenticated(request)  # must not raise
 
 
-def test_require_local_or_authenticated_requires_token_even_for_local_once_configured():
-    """Once an operator opts into token auth, it applies uniformly -- a
-    local client without the header is no longer silently exempted."""
+def test_require_local_or_authenticated_allows_local_even_with_token_configured_and_no_header():
+    """Correction v1.4 #4: configuring CONTROL_API_TOKEN protects REMOTE
+    access -- it must never lock out the local panel, which never sends
+    (and must never need to know) the token."""
     settings = Settings(control_api_token="s3cr3t")
     request = _FakeRequest("127.0.0.1", settings, headers={})
-    with pytest.raises(HTTPException):
+    require_local_or_authenticated(request)  # must not raise
+
+
+def test_require_local_or_authenticated_denies_when_client_is_absent():
+    """request.client can be None (e.g. certain raw ASGI transports) --
+    treated as untrusted/non-local, never as an implicit bypass."""
+    settings = Settings(control_api_token="")
+    request = _FakeRequest(None, settings)
+    with pytest.raises(HTTPException) as excinfo:
         require_local_or_authenticated(request)
+    assert excinfo.value.status_code == 403
+
+
+def test_spoofed_forwarded_headers_alone_never_grant_access():
+    """A remote client cannot talk its way into "local" by sending common
+    reverse-proxy headers -- only the real, ASGI-server-reported
+    request.client.host is ever consulted for the trust decision."""
+    settings = Settings(control_api_token="")
+    request = _FakeRequest(
+        "203.0.113.5", settings,
+        headers={
+            "X-Forwarded-For": "127.0.0.1",
+            "X-Real-IP": "127.0.0.1",
+            "X-Forwarded-Host": "127.0.0.1",
+        },
+    )
+    with pytest.raises(HTTPException) as excinfo:
+        require_local_or_authenticated(request)
+    assert excinfo.value.status_code == 403
 
 
 # --- Integração real via TestClient (rota completa, não só a dependência) -
+# TestClient always presents as client_host="testclient" (included in
+# LOCAL_CLIENT_HOSTS) -- these exercise the actual HTTP route stack for the
+# LOCAL-access policy; the REMOTE-access policy (deny without token, allow
+# with correct token, deny with wrong token, deny with no request.client,
+# deny on spoofed forwarded headers) is proven directly against
+# require_local_or_authenticated() above, since TestClient has no supported
+# way to present a different peer address.
 
 def _make_client(tmp_path, **settings_overrides):
     from app.persistence.db import init_db, make_engine, make_session_factory
@@ -166,18 +201,40 @@ def test_engage_never_requires_authentication(tmp_path):
     assert response.json()["kill_switch_engaged"] is True
 
 
-def test_disengage_denied_end_to_end_when_token_configured_and_missing(tmp_path):
+def test_local_panel_engage_and_disengage_work_with_token_configured(tmp_path):
+    """Item 8 of the required proof: the LOCAL panel flow (engage then
+    disengage) must keep working end to end even with CONTROL_API_TOKEN
+    configured for remote protection -- reproducing the exact bug the
+    audit found (token configured => local panel locked out)."""
     client, _ = _make_client(tmp_path, control_api_token="s3cr3t")
-    client.post("/api/kill-switch/engage")
-    response = client.post("/api/kill-switch/disengage")  # no X-Control-Token header
-    assert response.status_code == 403
+
+    engage_response = client.post("/api/kill-switch/engage")
+    assert engage_response.status_code == 200
+    assert engage_response.json()["kill_switch_engaged"] is True
+
+    disengage_response = client.post("/api/kill-switch/disengage")  # no header, still local
+    assert disengage_response.status_code == 200
+    assert disengage_response.json()["kill_switch_engaged"] is False
 
 
-def test_disengage_allowed_end_to_end_with_correct_token(tmp_path):
-    client, _ = _make_client(tmp_path, control_api_token="s3cr3t")
+def test_local_panel_disengage_works_without_any_token_configured(tmp_path):
+    client, _ = _make_client(tmp_path, control_api_token="")
     client.post("/api/kill-switch/engage")
-    response = client.post(
-        "/api/kill-switch/disengage", headers={"X-Control-Token": "s3cr3t"}
-    )
+    response = client.post("/api/kill-switch/disengage")
     assert response.status_code == 200
     assert response.json()["kill_switch_engaged"] is False
+
+
+def test_frontend_never_sends_or_embeds_the_control_token():
+    """The token must never be exposed in JS/HTML -- the local panel simply
+    doesn't participate in the token scheme at all (see module docstring in
+    app/api/routes_control.py)."""
+    from pathlib import Path
+
+    frontend_dir = Path(__file__).resolve().parent.parent / "frontend"
+    app_js = (frontend_dir / "app.js").read_text(encoding="utf-8")
+    index_html = (frontend_dir / "index.html").read_text(encoding="utf-8")
+    assert "X-Control-Token" not in app_js
+    assert "CONTROL_API_TOKEN" not in app_js
+    assert "X-Control-Token" not in index_html
+    assert "CONTROL_API_TOKEN" not in index_html
