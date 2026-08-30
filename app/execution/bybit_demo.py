@@ -20,7 +20,7 @@ import time
 from typing import Callable
 
 from app.core.config import assert_demo_host
-from app.core.errors import ExchangeTimeoutError, RateLimitError
+from app.core.errors import ExchangeDataIncompleteError, ExchangeTimeoutError, RateLimitError
 from app.core.logging import get_logger, log_event
 from app.execution.base import FillEvent, OrderStatusSnapshot, SubmitAck
 from app.execution.order_state import OrderStatus
@@ -39,6 +39,23 @@ _BYBIT_STATUS_MAP = {
     "PartiallyFilledCanceled": OrderStatus.CANCELLED,
     "Rejected": OrderStatus.REJECTED,
 }
+
+# Correção v1.2 #1/#2: statuses that can carry a fill (including a residual
+# fill on a cancellation that raced a partial fill -- "PartiallyFilledCanceled"
+# maps to CANCELLED above) -- these are exactly the statuses that trigger a
+# paginated /v5/execution/list walk before this engine will call the fill
+# picture "complete" for that order.
+_STATUSES_REQUIRING_FILL_SYNC = frozenset(
+    {OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED, OrderStatus.CANCELLED}
+)
+
+# Defensive caps -- Bybit's real V5 pagination caps `limit` at 100 per page;
+# `_MAX_PAGES` is a backstop against an infinite loop from a
+# misbehaving/malicious API response, never expected to be hit in practice.
+_EXECUTION_PAGE_LIMIT = 50
+_MAX_EXECUTION_PAGES = 50
+_OPEN_ORDERS_PAGE_LIMIT = 50
+_MAX_OPEN_ORDERS_PAGES = 50
 
 
 class BybitDemoExecutionEngine:
@@ -88,12 +105,18 @@ class BybitDemoExecutionEngine:
         return SubmitAck(exchange_order_id=exchange_order_id, status=OrderStatus.SUBMITTED)
 
     def poll_order(self, exchange_order_id: str) -> OrderStatusSnapshot:
-        """ONE status query + (only if a fill is possible) ONE execution-
-        list query -- no internal retry loop. Returns the FULL list of
-        fills the exchange currently reports; the fill ledger
-        (app/execution/fill_ledger.py) is what deduplicates against
-        already-persisted `exchange_fill_id`s, so re-polling the same
-        order repeatedly is always safe."""
+        """ONE status query + (only for a status that can carry a fill) a
+        FULLY PAGINATED `/v5/execution/list` walk -- no internal retry
+        loop on the status query itself (the periodic poller IS the retry
+        mechanism for that), but the execution-list pagination always runs
+        to completion or reports itself incomplete via `fills_complete`.
+
+        Correção v1.2 #1: a terminal `status` (FILLED/CANCELLED) is
+        reported EVEN WHEN the fill sync is incomplete -- the caller
+        (`app/execution/fill_service.py::apply_order_snapshot`) is the one
+        that must never persist that terminal status until
+        `fills_complete=True`. This engine's job is only to report the
+        truth of both facts accurately, never to fabricate completeness."""
         try:
             status_resp = self._http_get(
                 f"{self.base_url}/v5/order/realtime",
@@ -111,26 +134,66 @@ class BybitDemoExecutionEngine:
         status = _BYBIT_STATUS_MAP.get(raw_status, OrderStatus.UNKNOWN)
 
         fills: list[FillEvent] = []
-        if status in (OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED):
+        fills_complete = True
+        if status in _STATUSES_REQUIRING_FILL_SYNC:
+            fills, fills_complete = self._fetch_all_executions(exchange_order_id)
+
+        return OrderStatusSnapshot(
+            exchange_order_id=exchange_order_id, status=status, fills=fills, fills_complete=fills_complete,
+        )
+
+    def _fetch_all_executions(self, exchange_order_id: str) -> tuple[list[FillEvent], bool]:
+        """Correção v1.2 #2: walks every page of `/v5/execution/list` for
+        this order via `nextPageCursor`, with an explicit page `limit`, a
+        repeated-cursor guard, malformed-page detection, and a defensive
+        page-count cap. Returns `(fills_gathered_so_far, complete)` --
+        NEVER discards fills already validated before an interruption
+        (timeout, rate limit, malformed page, repeated cursor, or the page
+        cap), so a caller can safely record partial progress rather than
+        lose it."""
+        fills: list[FillEvent] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+
+        for _ in range(_MAX_EXECUTION_PAGES):
+            params = {"category": "linear", "orderId": exchange_order_id, "limit": _EXECUTION_PAGE_LIMIT}
+            if cursor:
+                params["cursor"] = cursor
             try:
-                exec_resp = self._http_get(
-                    f"{self.base_url}/v5/execution/list",
-                    {"category": "linear", "orderId": exchange_order_id},
-                )
-                for row in exec_resp.get("result", {}).get("list", []):
+                resp = self._http_get(f"{self.base_url}/v5/execution/list", params)
+            except (ExchangeTimeoutError, RateLimitError) as exc:
+                log_event(logger, 30, "execution_list_poll_failed", error=str(exc))
+                return fills, False
+
+            result = resp.get("result") or {}
+            rows = result.get("list")
+            if rows is None or not isinstance(rows, list):
+                log_event(logger, 30, "execution_list_malformed_page")
+                return fills, False
+
+            try:
+                for row in rows:
                     fills.append(FillEvent(
                         exchange_fill_id=row["execId"],
-                        fill_qty=float(row.get("execQty", 0.0)),
-                        fill_price=float(row.get("execPrice", 0.0)),
+                        fill_qty=float(row["execQty"]),
+                        fill_price=float(row["execPrice"]),
                         fee=float(row.get("execFee", 0.0)),
                     ))
-            except (ExchangeTimeoutError, RateLimitError) as exc:
-                # Status is still real and reportable; fill details are
-                # simply deferred to the next poll rather than blocking or
-                # fabricating them here.
-                log_event(logger, 30, "execution_list_poll_failed", error=str(exc))
+            except (KeyError, TypeError, ValueError) as exc:
+                log_event(logger, 30, "execution_list_malformed_row", error=str(exc))
+                return fills, False
 
-        return OrderStatusSnapshot(exchange_order_id=exchange_order_id, status=status, fills=fills)
+            next_cursor = result.get("nextPageCursor")
+            if not next_cursor:
+                return fills, True
+            if next_cursor in seen_cursors:
+                log_event(logger, 30, "execution_list_cursor_repeated")
+                return fills, False
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
+        log_event(logger, 30, "execution_list_page_limit_exceeded")
+        return fills, False
 
     def request_cancel(self, exchange_order_id: str) -> None:
         """Fire-and-forget (correção v1.1 #1): the caller persists
@@ -148,22 +211,56 @@ class BybitDemoExecutionEngine:
             # what actually determines the truth, never this method.
 
     def list_open_orders(self, symbol: str) -> list[dict]:
-        """Correção v1.1 #3: every order the exchange currently considers
-        open (New/PartiallyFilled) for `symbol` -- used by reconciliation
-        to detect an order the exchange has that isn't tracked locally."""
-        try:
-            resp = self._http_get(
-                f"{self.base_url}/v5/order/realtime", {"category": "linear", "symbol": symbol},
+        """Correção v1.1 #3 / v1.2 #4: every order the exchange currently
+        considers open (New/PartiallyFilled) for `symbol` -- used by
+        reconciliation to detect an order the exchange has that isn't
+        tracked locally.
+
+        Correção v1.2 #4: a transport failure (timeout, rate limit) or a
+        broken pagination contract (malformed page, repeated cursor, page
+        cap exceeded) is NEVER swallowed into an empty list -- that made a
+        reconciliation with no local open orders look "clean" even though
+        the exchange was never actually reached. Every one of those cases
+        now raises (`ExchangeTimeoutError`/`RateLimitError`/
+        `ExchangeDataIncompleteError`), which `Orchestrator._reconcile_orders_step`
+        already treats as a failed verification, never a valid empty
+        result. Only a genuinely complete, successfully-paginated response
+        may represent an empty list."""
+        orders: list[dict] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+
+        for _ in range(_MAX_OPEN_ORDERS_PAGES):
+            params = {"category": "linear", "symbol": symbol, "limit": _OPEN_ORDERS_PAGE_LIMIT}
+            if cursor:
+                params["cursor"] = cursor
+            resp = self._http_get(f"{self.base_url}/v5/order/realtime", params)
+
+            result = resp.get("result") or {}
+            rows = result.get("list")
+            if rows is None or not isinstance(rows, list):
+                raise ExchangeDataIncompleteError(
+                    "Página malformada ao consultar ordens abertas na corretora."
+                )
+            orders.extend(
+                {"exchange_order_id": row.get("orderId"), "side": row.get("side"), "qty": float(row.get("qty", 0.0))}
+                for row in rows
+                if row.get("orderStatus") in ("New", "PartiallyFilled")
             )
-        except (ExchangeTimeoutError, RateLimitError) as exc:
-            log_event(logger, 30, "list_open_orders_failed", error=str(exc))
-            return []
-        rows = resp.get("result", {}).get("list", [])
-        return [
-            {"exchange_order_id": row.get("orderId"), "side": row.get("side"), "qty": float(row.get("qty", 0.0))}
-            for row in rows
-            if row.get("orderStatus") in ("New", "PartiallyFilled")
-        ]
+
+            next_cursor = result.get("nextPageCursor")
+            if not next_cursor:
+                return orders
+            if next_cursor in seen_cursors:
+                raise ExchangeDataIncompleteError(
+                    "Cursor repetido ao paginar ordens abertas na corretora."
+                )
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
+        raise ExchangeDataIncompleteError(
+            "Limite de páginas excedido ao paginar ordens abertas na corretora."
+        )
 
     def get_position(self, symbol: str) -> dict | None:
         resp = self._http_get(

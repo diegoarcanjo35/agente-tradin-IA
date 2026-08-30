@@ -78,16 +78,32 @@ alimentada por `repo.filled_orders()` via `GET /api/costs`:
   retornam `"indisponível"` — nunca um zero fabricado. `unpriced_orders_count`
   reporta quantas ordens ficaram de fora desse cálculo.
 
-## Funding real (correção v1.1 #6)
+## Funding real (correção v1.1 #6, corrigido em v1.2 #3)
 
-`app/execution/funding.py::BybitFundingProvider.list_funding(symbol, since)`
-consulta o extrato de transações da Bybit (`/v5/account/transaction-log`,
-`type=SETTLEMENT`) através do mesmo transporte injetável `(url, params) ->
-dict` usado em todo `app/execution`/`app/market_data` — testável com
-`tests/fakes/bybit_fake.py`, zero rede real. `record_new_funding_events`
-deduplica por `funding_id` (índice único, migração v4) — repetir o mesmo
-lançamento entre polls, ou após um reinício com uma janela `since`
-sobreposta, é sempre um no-op seguro.
+`app/execution/funding.py::BybitFundingProvider.list_funding(symbol, since,
+until)` consulta o extrato de transações da Bybit
+(`/v5/account/transaction-log`, `type=SETTLEMENT`) através do mesmo
+transporte injetável `(url, params) -> dict` usado em todo
+`app/execution`/`app/market_data` — testável com `tests/fakes/bybit_fake.py`,
+zero rede real. `record_new_funding_events` deduplica por `funding_id`
+(índice único, migração v4) — repetir o mesmo lançamento entre polls, ou
+após um reinício com uma janela `since` sobreposta, é sempre um no-op
+seguro.
+
+**Correção v1.2 #3**: `list_funding` lia `row["change"]` — para uma linha
+`SETTLEMENT`, esse é o delta TOTAL da conta (pode incorporar `cashFlow` e
+`fee`), não o valor de funding propriamente dito. O campo correto,
+`row["funding"]`, é agora o único jamais persistido como valor de funding.
+`list_funding` também pagina integralmente (`nextPageCursor`, com guarda
+contra cursor repetido, página malformada e limite defensivo de páginas) e
+nunca lança exceção nesse processo — retorna `(records, complete)`, e o
+chamador (`Orchestrator._maybe_collect_funding`) fatia o intervalo
+`[since, now]` em janelas de até `FUNDING_WINDOW_SECONDS` (7 dias),
+persistindo cada janela assim que coletada e parando na primeira janela
+incompleta (nunca avança além de uma coleta comprovadamente completa). Uma
+linha com campo obrigatório ausente/inválido (`id`, `symbol`, `funding`,
+`transactionTime`) é descartada silenciosamente — nunca convertida num
+zero fabricado.
 
 Coleta periódica via `Orchestrator._maybe_collect_funding`, gated por
 `FUNDING_POLL_INTERVAL_SECONDS`, **só quando `mode=BYBIT_DEMO`**

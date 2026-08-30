@@ -32,20 +32,46 @@ def apply_order_snapshot(
 ) -> FillApplicationResult:
     """Reconciles `order`'s persisted status/fills with `snapshot` (from
     `ExecutionEngine.poll_order()`):
-    1. Transitions `order.status` to `snapshot.status` if it actually
-       changed (never a no-op transition into the same terminal state --
-       `transition_order_status` already rejects that, so this only
-       attempts it when needed).
+    1. Correção v1.2 #1: a TERMINAL `snapshot.status` (FILLED/CANCELLED/
+       REJECTED) is only ever persisted once `snapshot.fills_complete` is
+       True -- the audited defect was exactly this: `poll_order()` could
+       report `status=FILLED` with `fills=[]` after an execution-list
+       timeout, `apply_order_snapshot` would still persist FILLED, and
+       `repo.non_terminal_orders()` would then drop the order from the
+       recoverable set forever, permanently losing its fills/position/fees.
+       When `fills_complete=False`, `order.status` is deliberately left
+       UNCHANGED (so it stays non-terminal and therefore stays selected by
+       `repo.non_terminal_orders()` for the next poll) -- only
+       `order.pending_exchange_status`/`order.fills_sync_status` record
+       what the exchange reported, as an audit trail, never as the
+       authoritative status. The eventual real transition (once a later
+       poll proves `fills_complete=True`) applies the terminal status AND
+       every gathered fill together, in this same function call/transaction
+       -- there is no window where one is persisted without the other.
     2. Records any NEW fills via the idempotent ledger
        (`fill_ledger.record_new_fills` -- already-seen `exchange_fill_id`s
-       are silently skipped), then applies each new fill's DELTA to the
-       position: opens/adds for an entry order, reduces/closes (with
-       realized PnL) for a close order.
+       are silently skipped) REGARDLESS of `fills_complete` -- fills
+       already validated before an interruption are never held back or
+       discarded, only the terminal status transition is deferred. Applies
+       each new fill's DELTA to the position: opens/adds for an entry
+       order, reduces/closes (with realized PnL) for a close order.
+       Correção v1.2 #5: an entry fill (`is_close=False`) is NEVER summed
+       onto a position on the OPPOSITE side -- a late/opposite fill is
+       blocked (never fabricated into the wrong position) and flagged as a
+       security event + ambiguous state, requiring reconciliation.
     3. Refreshes `SystemState.order_state_unknown` and recomputes
        `trading_blocked` accordingly.
     """
     current = OrderStatus(order.status)
-    if snapshot.status != current:
+    if is_terminal(snapshot.status) and not snapshot.fills_complete:
+        # Correção v1.2 #1: never terminalize before the fill history is
+        # proven complete -- record the exchange's claim for audit/
+        # observability, but leave `order.status` exactly where it is.
+        if snapshot.exchange_order_id and not order.exchange_order_id:
+            order.exchange_order_id = snapshot.exchange_order_id
+        order.pending_exchange_status = snapshot.status.value
+        order.fills_sync_status = "PENDING"
+    elif snapshot.status != current:
         if snapshot.exchange_order_id and not order.exchange_order_id:
             order.exchange_order_id = snapshot.exchange_order_id
         try:
@@ -53,6 +79,9 @@ def apply_order_snapshot(
                 session, order, snapshot.status,
                 detail=f"poll_order() reportou {snapshot.status.value}.",
             )
+            if is_terminal(snapshot.status):
+                order.fills_sync_status = "COMPLETE"
+                order.pending_exchange_status = None
         except IllegalOrderTransitionError:
             # A snapshot arriving out of order (e.g. a stale poll racing a
             # newer one) is reported as UNKNOWN rather than silently
@@ -68,7 +97,7 @@ def apply_order_snapshot(
     closed_fully: bool | None = None
 
     if new_rows:
-        increment_session_counter(op_session, "fills_count")
+        increment_session_counter(op_session, "fills_count", by=len(new_rows))
         existing = repo.open_positions(session, order.symbol)
         position = existing[0] if existing else None
 
@@ -79,6 +108,18 @@ def apply_order_snapshot(
                         session, order.symbol, order.side, row.fill_qty, row.fill_price,
                         order.stop_loss, order.take_profit, opening_fee=row.fee,
                     )
+                elif position.side != order.side:
+                    # Correção v1.2 #5: a late/opposite fill -- e.g. the
+                    # position already flipped/closed by the time this fill
+                    # arrived. Never fabricate a state by summing onto the
+                    # wrong side; block and require reconciliation instead.
+                    state.state_ambiguous = True
+                    detail = (
+                        f"Fill de entrada ({order.side}) da ordem {order.id} recebido, mas a posição "
+                        f"aberta em {order.symbol} está do lado {position.side} -- fill NÃO aplicado "
+                        "à posição (bloqueio de segurança); requer reconciliação manual."
+                    )
+                    repo.record_security_event(session, "LATE_OPPOSITE_FILL_BLOCKED", detail)
                 else:
                     repo.add_to_position(session, position, row.fill_qty, row.fill_price, row.fee)
             else:

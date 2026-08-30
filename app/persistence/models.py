@@ -118,6 +118,20 @@ class Order(Base):
     # (avg_fill_price vs. this) per order. Nullable: a pre-Fase-2 order
     # migrated from an older schema never had this recorded.
     reference_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Correção v1.2 #1: the exchange reported a TERMINAL status
+    # (Filled/Cancelled) for this order, but the fill-history pagination
+    # was not yet proven complete -- `status` itself deliberately stays
+    # UNCHANGED (non-terminal) until it is, so the order stays in
+    # `repo.non_terminal_orders()`'s recoverable set. Purely an audit/
+    # observability trail -- never read as authoritative by anything that
+    # gates trading. Cleared back to None once the real transition applies.
+    pending_exchange_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # "COMPLETE" (default) | "PENDING" -- mirrors pending_exchange_status
+    # (non-None iff "PENDING"), kept as its own column since the audit
+    # explicitly names this pattern ("fills_sync_status") as an acceptable
+    # design, and it is clearer to read directly than inferring from
+    # nullability of the column above.
+    fills_sync_status: Mapped[str] = mapped_column(String(16), default="COMPLETE")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

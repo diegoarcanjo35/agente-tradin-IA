@@ -43,10 +43,21 @@ class OrderStatusSnapshot:
     delta) -- deduplication against what's already persisted is the
     ledger's job (app/execution/fill_ledger.py::record_new_fills), not the
     caller's, so a caller can safely re-poll and re-apply as often as it
-    wants."""
+    wants.
+
+    Correção v1.2 #1/#2: `fills_complete` is True only when the engine
+    proved it walked the exchange's full fill-history pagination for this
+    order (every `nextPageCursor` followed to the end) -- False whenever a
+    timeout, rate limit, malformed page, repeated cursor, or defensive
+    page-count limit interrupted that walk partway. `fills` still carries
+    whatever was validated before the interruption (never discarded), but
+    `fills_complete=False` tells the caller (app/execution/fill_service.py)
+    it must NOT treat a terminal `status` as safe to finalize yet -- see
+    `app/execution/fill_service.py::apply_order_snapshot`."""
     exchange_order_id: str
     status: OrderStatus  # SUBMITTED | PARTIALLY_FILLED | FILLED | CANCELLED | REJECTED | UNKNOWN
     fills: list[FillEvent]
+    fills_complete: bool = True
 
 
 class ExecutionEngine(Protocol):

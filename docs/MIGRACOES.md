@@ -21,8 +21,9 @@ obrigatório (`NOT NULL`), sem índice único em `candles`.
 | `2` | v1 → v2 (correção v1.2) | Adiciona `system_state.clock_out_of_sync`; remove duplicatas históricas em `candles` (mantendo o registro de menor `id` — o mais antigo inserido — como canônico) e cria o índice único `uq_candle_symbol_timeframe_open_time`. |
 | `3` | v2 → v3 (Fase 2 v1.0) | Adiciona `orders.filled_qty`/`avg_fill_price`/`fees_total`/`reference_price` (máquina de estados de ordens, ver `docs/ORDEM_E_FILLS.md`); cria as tabelas `order_events` e `operational_sessions` (ver `docs/SESSOES_OPERACIONAIS.md`); adiciona as novas causas independentes de bloqueio em `system_state` (`reconciliation_diverged`, `reconciliation_stale`, `order_state_unknown`, `initialization_not_reconciled`, `last_reconciliation_at`, `operational_state`, `active_session_id`); adiciona `order_id`/`session_id` opcionais em `failures_reconciliations`. |
 | `4` | v3 → v4 (correção Fase 2 v1.1) | Adiciona `executions.exchange_fill_id` + índice único `(order_id, exchange_fill_id)` (ledger de fills idempotente, ver `docs/ORDEM_E_FILLS.md`); adiciona `failures_reconciliations.mismatches_json` (resultado estruturado de reconciliação); adiciona `operational_sessions.config_fingerprint` (retomada sensível a mudança de configuração, ver `docs/SESSOES_OPERACIONAIS.md`); cria a tabela `funding_events` + índice único em `funding_id` (coleta idempotente de funding, ver `docs/METRICAS.md`). |
+| `5` | v4 → v5 (correção Fase 2 v1.2) | Adiciona `orders.pending_exchange_status` e `orders.fills_sync_status` (`NOT NULL DEFAULT 'COMPLETE'`) — separa o status que a corretora reportou da comprovação de que o histórico de fills foi sincronizado por completo, para nunca terminalizar uma ordem antes disso (ver `docs/ORDEM_E_FILLS.md`). |
 
-`CURRENT_SCHEMA_VERSION = 4` (constante em `app/persistence/migrations.py`),
+`CURRENT_SCHEMA_VERSION = 5` (constante em `app/persistence/migrations.py`),
 sempre igual à versão da migration mais recente da lista `MIGRATIONS`.
 
 ## Quando as migrations rodam
@@ -108,6 +109,10 @@ coluna sentinela) contra o esquema real:
   `failures_reconciliations.mismatches_json` existe;
   `operational_sessions.config_fingerprint` existe; a tabela
   `funding_events` existe **e** tem um índice único sobre `funding_id`.
+- **v5** (correção v1.2 #7): `orders.pending_exchange_status` existe e
+  aceita `NULL`; `orders.fills_sync_status` existe **e** genuinamente
+  rejeita `NULL` — checado via nulabilidade real da coluna
+  (`PRAGMA table_info`), não apenas a presença dela.
 
 ### Cadeia ancestral completa, não só a versão mais alta (correção v1.5 #2)
 

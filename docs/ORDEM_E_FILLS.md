@@ -12,6 +12,16 @@ persistente pós-`submit()`, e com fills aplicados por sobrescrita cumulativa
 em vez de por delta idempotente. O que está documentado abaixo é o desenho
 corrigido.
 
+**Correção da Fase 2 v1.2 #1/#2** fechou uma lacuna remanescente: mesmo com
+`SUBMITTED`/`CANCEL_PENDING` persistidos, `apply_order_snapshot()` ainda
+podia persistir um status TERMINAL (`FILLED`/`CANCELLED`) antes de o
+histórico de fills estar comprovadamente sincronizado -- se
+`/v5/execution/list` sofresse timeout logo após `/v5/order/realtime`
+reportar `Filled`, a ordem virava `FILLED` com `fills=[]`, saía do conjunto
+recuperável (`repo.non_terminal_orders()`) e nunca mais era repollada,
+perdendo fills/posição/taxas para sempre. Ver "Separação status vs.
+sincronização de fills" abaixo.
+
 ## Estados
 
 `app/execution/order_state.py::OrderStatus`:
@@ -130,6 +140,42 @@ ordem fica sem rastro no lado da corretora; a deduplicação por
 reconciliação (que também consulta `list_open_orders()`) é o mecanismo que
 eventualmente resolve a ambiguidade.
 
+## Separação status vs. sincronização de fills (correção v1.2 #1/#2)
+
+`Order` ganhou duas colunas puramente de auditoria/observabilidade
+(migração v5): `pending_exchange_status` (o status TERMINAL que a
+corretora reportou, ainda não aplicado) e `fills_sync_status`
+(`"COMPLETE"` padrão | `"PENDING"`). Nenhuma das duas é lida por código que
+decide se a ordem está no conjunto recuperável -- essa garantia vem de algo
+mais simples e já existente: `Order.status` só é escrito quando o histórico
+de fills está comprovadamente completo.
+
+```
+status da ordem (Order.status)      sincronização de fills
+------------------------------      -----------------------
+SUBMITTED (inalterado)         <->  fills_sync_status = "PENDING"
+                                     pending_exchange_status = "FILLED"
+       |
+       | poll_order() com fills_complete=True
+       v
+FILLED (transição real)        <->  fills_sync_status = "COMPLETE"
+                                     pending_exchange_status = None
+```
+
+`OrderStatusSnapshot.fills_complete` (retornado por `poll_order()`) é
+`True` só quando `BybitDemoExecutionEngine` provou ter percorrido toda a
+paginação de `/v5/execution/list` (`nextPageCursor` até o fim) sem timeout,
+rate limit, página malformada, cursor repetido ou estourar o limite
+defensivo de páginas (50). Quando `fills_complete=False` e o status
+reportado é terminal, `fill_service.apply_order_snapshot()` NUNCA
+transiciona `Order.status` -- a ordem permanece com seu status anterior
+(não-terminal), continuando selecionada por `repo.non_terminal_orders()`
+para o próximo poll. Fills já validados antes de uma interrupção (ex.: a
+primeira página de duas) são gravados imediatamente mesmo assim -- só a
+transição de status é adiada, nunca o progresso já comprovado. O mesmo vale
+para `CANCELLED` (inclusive `PartiallyFilledCanceled`, quando um fill
+vence a corrida do cancelamento).
+
 ## Testes
 
 `tests/test_order_state_machine.py` (transições válidas/inválidas),
@@ -141,4 +187,14 @@ CANCELLED, reinício sem reenvio, `POST /order/create` uma única vez),
 `list_open_orders`), `tests/test_partial_fill_policy.py` (WAIT/
 CANCEL_REMAINDER/EXPIRE_AND_CANCEL), `tests/test_reconciliation_periodic_and_order_lifecycle.py`
 (fiação real via `Orchestrator`, ordem `UNKNOWN` bloqueando entradas, kill
-switch cancelando pendências pelo caminho centralizado).
+switch cancelando pendências pelo caminho centralizado),
+`tests/test_fill_sync_gating.py` (Filled+timeout no histórico permanece
+recuperável, resolução atômica no poll seguinte, reinício entre polls,
+cancelamento com fill residual, falha em página posterior sem perda/
+duplicação), `tests/test_execution_list_pagination.py` (paginação completa
+de `/v5/execution/list`: múltiplas páginas/50+ fills em ordem adversarial,
+sobreposição entre páginas, cursor repetido, falha intermediária, página
+malformada, limite de páginas), `tests/test_late_opposite_fill.py` (fill
+tardio/oposto nunca somado à posição errada, fill residual de fechamento
+após posição já encerrada, símbolos independentes, reinício entre a
+mudança de posição e a chegada do fill).

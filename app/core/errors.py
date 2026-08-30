@@ -38,6 +38,18 @@ class RateLimitError(TradingSystemError):
     """Raised when the exchange reports a rate limit violation."""
 
 
+class ExchangeDataIncompleteError(TradingSystemError):
+    """Correção Fase 2 v1.2 #2/#4: raised when a paginated exchange query
+    (open orders, execution history, funding transaction log) cannot be
+    proven complete -- a malformed page, a repeated `nextPageCursor`, or a
+    defensive page-count limit being exceeded. Distinct from
+    ExchangeTimeoutError/RateLimitError (pure transport failures) because
+    this can happen even when every individual HTTP call "succeeds" but the
+    API's own pagination contract was violated or exhausted unsafely.
+    Callers must never treat an incomplete result as if it were a genuine
+    empty/complete one."""
+
+
 class ReconciliationMismatchError(TradingSystemError):
     """Raised when local state disagrees with exchange-reported state after restart."""
 

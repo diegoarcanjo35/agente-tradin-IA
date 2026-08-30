@@ -49,6 +49,12 @@ Schema history:
             persistent, idempotent fill ledger (app/execution/fill_ledger.py)
             that replaced overwriting cumulative totals with per-fill,
             delta-based application. See docs/ORDEM_E_FILLS.md.
+  v4 -> v5  (correção Fase 2 v1.2): adds orders.pending_exchange_status and
+            orders.fills_sync_status -- separates "status the exchange
+            reported" from "fill history proven complete", so a terminal
+            status (Filled/Cancelled) is never persisted while the fill
+            sync is still incomplete (the order stays recoverable). See
+            docs/ORDEM_E_FILLS.md.
 """
 from __future__ import annotations
 
@@ -61,7 +67,7 @@ from sqlalchemy.engine import Connection, Engine
 
 from app.persistence.models import Base
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 
 class MigrationError(Exception):
@@ -350,6 +356,18 @@ def _migrate_to_v4(conn: Connection) -> None:
         ))
 
 
+def _migrate_to_v5(conn: Connection) -> None:
+    """Correção Fase 2 v1.2 #1/#7: separa "status reportado pela corretora"
+    de "histórico de fills comprovadamente completo" -- ver
+    docs/ORDEM_E_FILLS.md."""
+    if not _column_exists(conn, "orders", "pending_exchange_status"):
+        conn.execute(text("ALTER TABLE orders ADD COLUMN pending_exchange_status VARCHAR(16)"))
+    if not _column_exists(conn, "orders", "fills_sync_status"):
+        conn.execute(text(
+            "ALTER TABLE orders ADD COLUMN fills_sync_status VARCHAR(16) NOT NULL DEFAULT 'COMPLETE'"
+        ))
+
+
 # Order matters: applied strictly in ascending version order.
 MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
     (1, "Adiciona system_state.state_ambiguous, orders.is_close; relaxa orders.stop_loss para opcional.", _migrate_to_v1),
@@ -362,6 +380,10 @@ MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
         "operational_sessions.config_fingerprint -- retomada de sessão sensível a mudança de configuração; "
         "tabela funding_events -- coleta idempotente de funding.",
      _migrate_to_v4),
+    (5, "Adiciona orders.pending_exchange_status e orders.fills_sync_status -- separa status reportado "
+        "pela corretora de sincronização comprovada do histórico de fills, para nunca terminalizar uma "
+        "ordem antes de todos os fills serem aplicados.",
+     _migrate_to_v5),
 ]
 
 
@@ -421,11 +443,25 @@ def _v4_invariants_satisfied(conn: Connection) -> bool:
     )
 
 
+def _v5_invariants_satisfied(conn: Connection) -> bool:
+    """ALL structural invariants of v5 -- both columns exist, and
+    `fills_sync_status` genuinely rejects NULL (its NOT NULL DEFAULT is
+    what guarantees every pre-existing row got a safe 'COMPLETE' value
+    rather than silently ending up NULL)."""
+    return (
+        _column_exists(conn, "orders", "pending_exchange_status")
+        and _column_is_nullable(conn, "orders", "pending_exchange_status")
+        and _column_exists(conn, "orders", "fills_sync_status")
+        and not _column_is_nullable(conn, "orders", "fills_sync_status")
+    )
+
+
 _VERSION_INVARIANTS: dict[int, Callable[[Connection], bool]] = {
     1: _v1_invariants_satisfied,
     2: _v2_invariants_satisfied,
     3: _v3_invariants_satisfied,
     4: _v4_invariants_satisfied,
+    5: _v5_invariants_satisfied,
 }
 
 

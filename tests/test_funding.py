@@ -21,16 +21,17 @@ from app.api.main import build_orchestrator
 def test_list_funding_maps_debited_and_credited_rows():
     transport = FakeBybitTransport()
     transport.set_funding_events([
-        {"id": "F-1", "symbol": "BTCUSDT", "change": "-0.5", "transactionTime": "1700000000000"},
-        {"id": "F-2", "symbol": "BTCUSDT", "change": "0.3", "transactionTime": "1700000600000"},
+        {"id": "F-1", "symbol": "BTCUSDT", "funding": "-0.5", "change": "4.0", "transactionTime": "1700000000000"},
+        {"id": "F-2", "symbol": "BTCUSDT", "funding": "0.3", "change": "-1.0", "transactionTime": "1700000600000"},
     ])
     provider = BybitFundingProvider(transport.http_get, "https://api-demo.bybit.com")
 
-    records = provider.list_funding("BTCUSDT")
+    records, complete = provider.list_funding("BTCUSDT")
 
+    assert complete is True
     assert len(records) == 2
     assert records[0].funding_id == "F-1"
-    assert records[0].amount == -0.5
+    assert records[0].amount == -0.5  # the `funding` field, never `change`
     assert records[1].amount == 0.3
     assert records[0].occurred_at.tzinfo is not None
 
@@ -103,7 +104,7 @@ def test_orchestrator_periodic_funding_collection_persists_new_events_idempotent
     )
     transport = FakeBybitTransport()
     transport.set_funding_events([
-        {"id": "F-TICK-1", "symbol": "BTCUSDT", "change": "-1.25", "transactionTime": "1700000000000"},
+        {"id": "F-TICK-1", "symbol": "BTCUSDT", "funding": "-1.25", "transactionTime": "1700000000000"},
     ])
     orch = build_orchestrator(settings, bybit_transport=transport)
 

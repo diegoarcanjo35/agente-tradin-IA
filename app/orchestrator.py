@@ -32,7 +32,7 @@ from app.core.config import Settings
 from app.core.logging import get_logger, log_event
 from app.execution import fill_service
 from app.execution.base import ExecutionEngine
-from app.execution.funding import BybitFundingProvider, record_new_funding_events
+from app.execution.funding import FUNDING_WINDOW_SECONDS, BybitFundingProvider, record_new_funding_events
 from app.execution.idempotency import make_idempotency_key
 from app.execution.order_state import OrderStatus, is_terminal
 from app.execution.reconciliation import reconcile_orders, reconcile_positions
@@ -592,15 +592,24 @@ class Orchestrator:
             self._maybe_apply_partial_fill_policy(session, state, op_session, order, now)
 
     def _maybe_collect_funding(self, session, state) -> None:
-        """Correção v1.1 #6: periodic, idempotent funding collection --
-        only when `funding_provider` was actually wired (BYBIT_DEMO; never
-        PAPER_LIVE, which has no private credentials -- see
-        app/api/main.py::build_orchestrator). Gated by
+        """Correção v1.1 #6 / v1.2 #3: periodic, idempotent funding
+        collection -- only when `funding_provider` was actually wired
+        (BYBIT_DEMO; never PAPER_LIVE, which has no private credentials --
+        see app/api/main.py::build_orchestrator). Gated by
         `funding_poll_interval_seconds`, same periodic-gate pattern as
         `_maybe_poll_open_orders`. `since` is the latest `occurred_at`
         already on file for the symbol -- purely an optimization (dedup by
         `funding_id` is what actually makes this idempotent, not the
-        cursor), so it never needs its own persistent state column."""
+        cursor), so it never needs its own persistent state column.
+
+        Correção v1.2 #3: the `[since, now]` gap is walked in fixed-size
+        windows (`FUNDING_WINDOW_SECONDS`) -- each window's records are
+        persisted as soon as they're gathered (never batched until the
+        end), and windows are walked in chronological order, stopping at
+        the first incomplete one so a later, more-recent window is never
+        collected while an earlier gap is left unfilled. Any incomplete
+        window is logged as a structured, unresolved failure -- the period
+        is never presented as fully reconciled when it is not."""
         if self.funding_provider is None:
             return
         now = utcnow()
@@ -610,14 +619,33 @@ class Orchestrator:
         self._last_funding_poll_at = now
 
         since = repo.last_funding_occurred_at(session, self.settings.symbol)
+        window_start = since if since is not None else (now - timedelta(seconds=FUNDING_WINDOW_SECONDS))
+
         try:
-            records = self.funding_provider.list_funding(self.settings.symbol, since=since)
+            all_complete = True
+            while window_start < now:
+                window_end = min(window_start + timedelta(seconds=FUNDING_WINDOW_SECONDS), now)
+                records, complete = self.funding_provider.list_funding(
+                    self.settings.symbol, since=window_start, until=window_end,
+                )
+                if records:
+                    record_new_funding_events(session, records)
+                if not complete:
+                    all_complete = False
+                    detail = (
+                        f"Coleta de funding incompleta para {self.settings.symbol} entre "
+                        f"{window_start.isoformat()} e {window_end.isoformat()} -- será retomada no "
+                        "próximo ciclo, sem avançar além deste ponto."
+                    )
+                    repo.record_failure(session, "FAILURE", detail)
+                    repo.record_security_event(session, "FUNDING_COLLECTION_INCOMPLETE", detail)
+                    break
+                window_start = window_end
         except Exception as exc:  # noqa: BLE001 - a funding-collection failure never blocks trading
             detail = f"Não foi possível coletar funding da corretora: {exc}"
             repo.record_failure(session, "FAILURE", detail)
             repo.record_security_event(session, "FUNDING_COLLECTION_FAILED", detail)
             return
-        record_new_funding_events(session, records)
 
     def _maybe_apply_partial_fill_policy(self, session, state, op_session, order, now) -> None:
         """Correção v1.1 #2/#5: an order stuck PARTIALLY_FILLED longer than
