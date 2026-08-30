@@ -22,8 +22,9 @@ obrigatório (`NOT NULL`), sem índice único em `candles`.
 | `3` | v2 → v3 (Fase 2 v1.0) | Adiciona `orders.filled_qty`/`avg_fill_price`/`fees_total`/`reference_price` (máquina de estados de ordens, ver `docs/ORDEM_E_FILLS.md`); cria as tabelas `order_events` e `operational_sessions` (ver `docs/SESSOES_OPERACIONAIS.md`); adiciona as novas causas independentes de bloqueio em `system_state` (`reconciliation_diverged`, `reconciliation_stale`, `order_state_unknown`, `initialization_not_reconciled`, `last_reconciliation_at`, `operational_state`, `active_session_id`); adiciona `order_id`/`session_id` opcionais em `failures_reconciliations`. |
 | `4` | v3 → v4 (correção Fase 2 v1.1) | Adiciona `executions.exchange_fill_id` + índice único `(order_id, exchange_fill_id)` (ledger de fills idempotente, ver `docs/ORDEM_E_FILLS.md`); adiciona `failures_reconciliations.mismatches_json` (resultado estruturado de reconciliação); adiciona `operational_sessions.config_fingerprint` (retomada sensível a mudança de configuração, ver `docs/SESSOES_OPERACIONAIS.md`); cria a tabela `funding_events` + índice único em `funding_id` (coleta idempotente de funding, ver `docs/METRICAS.md`). |
 | `5` | v4 → v5 (correção Fase 2 v1.2) | Adiciona `orders.pending_exchange_status` e `orders.fills_sync_status` (`NOT NULL DEFAULT 'COMPLETE'`) — separa o status que a corretora reportou da comprovação de que o histórico de fills foi sincronizado por completo, para nunca terminalizar uma ordem antes disso (ver `docs/ORDEM_E_FILLS.md`). |
+| `6` | v5 → v6 (correção Fase 2 v1.3) | Cria a tabela `funding_collection_checkpoints` (uma linha por símbolo, índice único em `symbol`) — checkpoint explícito de cobertura de coleta de funding, nunca derivado do maior `occurred_at` já persistido em `funding_events` (ver `docs/METRICAS.md`). |
 
-`CURRENT_SCHEMA_VERSION = 5` (constante em `app/persistence/migrations.py`),
+`CURRENT_SCHEMA_VERSION = 6` (constante em `app/persistence/migrations.py`),
 sempre igual à versão da migration mais recente da lista `MIGRATIONS`.
 
 ## Quando as migrations rodam
@@ -113,6 +114,10 @@ coluna sentinela) contra o esquema real:
   aceita `NULL`; `orders.fills_sync_status` existe **e** genuinamente
   rejeita `NULL` — checado via nulabilidade real da coluna
   (`PRAGMA table_info`), não apenas a presença dela.
+- **v6** (correção v1.3 #3): a tabela `funding_collection_checkpoints`
+  existe **e** tem um índice único sobre `symbol` — checado pela estrutura
+  do índice, não só a tabela, porque é o índice que garante no máximo um
+  checkpoint por símbolo no nível do banco.
 
 ### Cadeia ancestral completa, não só a versão mais alta (correção v1.5 #2)
 

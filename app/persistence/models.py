@@ -255,6 +255,30 @@ class FundingEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class FundingCollectionCheckpoint(Base):
+    """Correção v1.2/v1.3 #1: explicit, persisted proof of funding-collection
+    COVERAGE, separate from the funding events themselves. `covered_until`
+    only ever advances when an entire `[since, until]` window was walked to
+    completion (every page fetched, every row valid) -- see
+    app.execution.funding/app.orchestrator._maybe_collect_funding. Using the
+    MAX `occurred_at` already on file (the pre-v1.3 approach) was unsafe: a
+    newest-first paginated response could persist a recent record from page
+    1 and then fail on an older page 2, and the next cycle's `since` would
+    jump past the still-unfetched backlog. One row per symbol -- the unique
+    index is what makes `record_new_funding_events`-style "insert or update"
+    logic race-safe at the database level, not just by convention."""
+
+    __tablename__ = "funding_collection_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("symbol", name="uq_funding_checkpoint_symbol"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(32))
+    covered_until: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class OperationalSession(Base):
     """Fase 2, item 7.7: one row per execution session -- created or resumed
     at process startup (app.sessions.start_or_resume_session), ended

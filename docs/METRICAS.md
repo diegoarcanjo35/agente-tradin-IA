@@ -102,8 +102,25 @@ chamador (`Orchestrator._maybe_collect_funding`) fatia o intervalo
 persistindo cada janela assim que coletada e parando na primeira janela
 incompleta (nunca avança além de uma coleta comprovadamente completa). Uma
 linha com campo obrigatório ausente/inválido (`id`, `symbol`, `funding`,
-`transactionTime`) é descartada silenciosamente — nunca convertida num
-zero fabricado.
+`transactionTime`) NUNCA é convertida num zero fabricado — e, desde a
+correção v1.3 #2, torna a janela inteira `complete=False` (deixa de ser
+apenas descartada silenciosamente com a página ainda contando como
+completa), com um diagnóstico estruturado (sem payload/credenciais)
+registrado via log.
+
+### Checkpoint de cobertura (correção v1.3 #1)
+
+O `since` de cada ciclo de coleta é lido de `FundingCollectionCheckpoint`
+(`repo.get_funding_checkpoint`/`advance_funding_checkpoint`, migração v6) —
+**nunca** do maior `occurred_at` já persistido em `funding_events`
+(abordagem anterior, insegura): numa resposta paginada do mais novo para o
+mais antigo, a página 1 podia persistir um registro recente e a página 2
+(mais antiga) falhar; o próximo ciclo, usando o maior `occurred_at`
+disponível, pularia o backlog ainda não coletado dessa mesma janela,
+tornando-o irrecuperável. O checkpoint só avança
+(`advance_funding_checkpoint`) quando uma janela inteira é comprovadamente
+completa (paginação inteira percorrida, nenhuma linha inválida) — nunca
+parcialmente, nunca com base em quais registros vieram ou em que ordem.
 
 Coleta periódica via `Orchestrator._maybe_collect_funding`, gated por
 `FUNDING_POLL_INTERVAL_SECONDS`, **só quando `mode=BYBIT_DEMO`**

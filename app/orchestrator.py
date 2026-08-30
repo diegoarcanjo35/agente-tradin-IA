@@ -592,24 +592,35 @@ class Orchestrator:
             self._maybe_apply_partial_fill_policy(session, state, op_session, order, now)
 
     def _maybe_collect_funding(self, session, state) -> None:
-        """Correção v1.1 #6 / v1.2 #3: periodic, idempotent funding
-        collection -- only when `funding_provider` was actually wired
-        (BYBIT_DEMO; never PAPER_LIVE, which has no private credentials --
-        see app/api/main.py::build_orchestrator). Gated by
+        """Correção v1.1 #6 / v1.2 #3 / v1.3 #1: periodic, idempotent
+        funding collection -- only when `funding_provider` was actually
+        wired (BYBIT_DEMO; never PAPER_LIVE, which has no private
+        credentials -- see app/api/main.py::build_orchestrator). Gated by
         `funding_poll_interval_seconds`, same periodic-gate pattern as
-        `_maybe_poll_open_orders`. `since` is the latest `occurred_at`
-        already on file for the symbol -- purely an optimization (dedup by
-        `funding_id` is what actually makes this idempotent, not the
-        cursor), so it never needs its own persistent state column.
+        `_maybe_poll_open_orders`.
 
-        Correção v1.2 #3: the `[since, now]` gap is walked in fixed-size
-        windows (`FUNDING_WINDOW_SECONDS`) -- each window's records are
-        persisted as soon as they're gathered (never batched until the
-        end), and windows are walked in chronological order, stopping at
-        the first incomplete one so a later, more-recent window is never
-        collected while an earlier gap is left unfilled. Any incomplete
-        window is logged as a structured, unresolved failure -- the period
-        is never presented as fully reconciled when it is not."""
+        Correção v1.3 #1: `since` is read from the explicit, persisted
+        `FundingCollectionCheckpoint` (`repo.get_funding_checkpoint`) --
+        NEVER derived from the MAX `occurred_at` already recorded in
+        `funding_events`. That approach was unsafe: a newest-first
+        paginated response could persist a recent record from page 1 and
+        then fail on an older page 2, and the next cycle's `since` would
+        jump past the still-unfetched backlog, making it permanently
+        unreachable. The checkpoint only ever advances
+        (`repo.advance_funding_checkpoint`) once an ENTIRE window is
+        proven complete -- never partially, never based on which records
+        happened to be returned or in what order.
+
+        The `[since, now]` gap is walked in fixed-size windows
+        (`FUNDING_WINDOW_SECONDS`) -- each window's records are persisted
+        as soon as they're gathered (never batched until the end, and
+        never discarded even when the window itself turns out
+        incomplete), and windows are walked in chronological order,
+        stopping at the first incomplete one so a later, more-recent
+        window is never collected (nor its checkpoint advanced) while an
+        earlier gap is left unfilled. Any incomplete window is logged as a
+        structured, unresolved failure -- the period is never presented as
+        fully reconciled when it is not."""
         if self.funding_provider is None:
             return
         now = utcnow()
@@ -618,11 +629,13 @@ class Orchestrator:
             return
         self._last_funding_poll_at = now
 
-        since = repo.last_funding_occurred_at(session, self.settings.symbol)
-        window_start = since if since is not None else (now - timedelta(seconds=FUNDING_WINDOW_SECONDS))
+        checkpoint = repo.get_funding_checkpoint(session, self.settings.symbol)
+        window_start = (
+            _reattach_utc(checkpoint.covered_until) if checkpoint is not None
+            else (now - timedelta(seconds=FUNDING_WINDOW_SECONDS))
+        )
 
         try:
-            all_complete = True
             while window_start < now:
                 window_end = min(window_start + timedelta(seconds=FUNDING_WINDOW_SECONDS), now)
                 records, complete = self.funding_provider.list_funding(
@@ -631,15 +644,15 @@ class Orchestrator:
                 if records:
                     record_new_funding_events(session, records)
                 if not complete:
-                    all_complete = False
                     detail = (
                         f"Coleta de funding incompleta para {self.settings.symbol} entre "
                         f"{window_start.isoformat()} e {window_end.isoformat()} -- será retomada no "
-                        "próximo ciclo, sem avançar além deste ponto."
+                        "próximo ciclo pela mesma janela, sem avançar o checkpoint de cobertura."
                     )
                     repo.record_failure(session, "FAILURE", detail)
                     repo.record_security_event(session, "FUNDING_COLLECTION_INCOMPLETE", detail)
                     break
+                repo.advance_funding_checkpoint(session, self.settings.symbol, window_end)
                 window_start = window_end
         except Exception as exc:  # noqa: BLE001 - a funding-collection failure never blocks trading
             detail = f"Não foi possível coletar funding da corretora: {exc}"

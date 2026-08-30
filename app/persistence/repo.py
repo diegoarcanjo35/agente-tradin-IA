@@ -18,6 +18,7 @@ from app.persistence.models import (
     AIRecommendation,
     Candle,
     FailureReconciliation,
+    FundingCollectionCheckpoint,
     FundingEvent,
     Order,
     OrderEvent,
@@ -331,11 +332,13 @@ def closed_positions(session: Session, symbol: str | None = None) -> list[Positi
 
 
 def last_funding_occurred_at(session: Session, symbol: str) -> datetime | None:
-    """Correção v1.1 #6: the latest `occurred_at` already on file for
-    `symbol` -- used only as an optimization for the `since` window of the
-    next collection poll (idempotency itself comes from the `funding_id`
-    unique index, not from this cursor, so a stale/None value here is
-    always safe, never a correctness risk)."""
+    """Informational only (e.g. a "última coleta em X" display) -- NEVER
+    used to drive funding-collection retomada since correção v1.3 #1/#3:
+    the MAX `occurred_at` of already-persisted events is not proof of
+    coverage (a newest-first paginated page can persist a recent record
+    while an older page in the SAME window still failed). See
+    `get_funding_checkpoint`/`advance_funding_checkpoint` for the real
+    coverage mechanism."""
     row = session.execute(
         select(FundingEvent.occurred_at)
         .where(FundingEvent.symbol == symbol)
@@ -356,6 +359,45 @@ def funding_total(session: Session, symbol: str | None = None) -> float:
     if symbol:
         stmt = stmt.where(FundingEvent.symbol == symbol)
     return sum(session.execute(stmt).scalars().all())
+
+
+def get_funding_checkpoint(session: Session, symbol: str) -> FundingCollectionCheckpoint | None:
+    """Correção v1.3 #1: the explicit, persisted proof of funding-collection
+    coverage for `symbol` -- `None` means nothing has ever been fully
+    covered yet (the caller anchors the first window at `now -
+    FUNDING_WINDOW_SECONDS` in that case, never at an unbounded past)."""
+    row = session.execute(
+        select(FundingCollectionCheckpoint).where(FundingCollectionCheckpoint.symbol == symbol)
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    if row.covered_until.tzinfo is None:
+        row.covered_until = row.covered_until.replace(tzinfo=timezone.utc)
+    return row
+
+
+def advance_funding_checkpoint(session: Session, symbol: str, covered_until: datetime) -> FundingCollectionCheckpoint:
+    """Correção v1.3 #1: only ever called by the caller once an ENTIRE
+    `[since, covered_until]` window was walked to completion (every page
+    fetched, every row valid) -- never advances on a partial/incomplete
+    window, and never moves backwards even if called with an earlier value
+    than what is already recorded (defensive -- the caller should never do
+    this, but the checkpoint's only job is to be a safe lower bound on what
+    is truly covered)."""
+    existing = session.execute(
+        select(FundingCollectionCheckpoint).where(FundingCollectionCheckpoint.symbol == symbol)
+    ).scalar_one_or_none()
+    if existing is None:
+        existing = FundingCollectionCheckpoint(symbol=symbol, covered_until=covered_until)
+        session.add(existing)
+    else:
+        current = existing.covered_until
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        if covered_until > current:
+            existing.covered_until = covered_until
+    session.flush()
+    return existing
 
 
 def save_account_snapshot(session: Session, balance: float, equity: float,

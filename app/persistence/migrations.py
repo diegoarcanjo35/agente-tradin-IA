@@ -55,6 +55,12 @@ Schema history:
             status (Filled/Cancelled) is never persisted while the fill
             sync is still incomplete (the order stays recoverable). See
             docs/ORDEM_E_FILLS.md.
+  v5 -> v6  (correção Fase 2 v1.3): adds the funding_collection_checkpoints
+            table (one row per symbol, unique index on symbol) -- an
+            explicit, persisted proof of funding-collection COVERAGE,
+            separate from the funding_events themselves and never derived
+            from their MAX(occurred_at) (unsafe under newest-first
+            pagination -- see app/execution/funding.py). See docs/METRICAS.md.
 """
 from __future__ import annotations
 
@@ -67,7 +73,7 @@ from sqlalchemy.engine import Connection, Engine
 
 from app.persistence.models import Base
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 
 
 class MigrationError(Exception):
@@ -368,6 +374,24 @@ def _migrate_to_v5(conn: Connection) -> None:
         ))
 
 
+def _migrate_to_v6(conn: Connection) -> None:
+    """Correção Fase 2 v1.3 #1/#3: checkpoint explícito e persistido de
+    cobertura de coleta de funding, um por símbolo -- ver
+    docs/METRICAS.md."""
+    conn.execute(text(
+        "CREATE TABLE IF NOT EXISTS funding_collection_checkpoints ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "symbol VARCHAR(32) NOT NULL, "
+        "covered_until DATETIME NOT NULL, "
+        "updated_at DATETIME NOT NULL"
+        ")"
+    ))
+    if not _has_unique_index_on(conn, "funding_collection_checkpoints", {"symbol"}):
+        conn.execute(text(
+            "CREATE UNIQUE INDEX uq_funding_checkpoint_symbol ON funding_collection_checkpoints (symbol)"
+        ))
+
+
 # Order matters: applied strictly in ascending version order.
 MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
     (1, "Adiciona system_state.state_ambiguous, orders.is_close; relaxa orders.stop_loss para opcional.", _migrate_to_v1),
@@ -384,6 +408,10 @@ MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
         "pela corretora de sincronização comprovada do histórico de fills, para nunca terminalizar uma "
         "ordem antes de todos os fills serem aplicados.",
      _migrate_to_v5),
+    (6, "Cria a tabela funding_collection_checkpoints (uma linha por símbolo, índice único em symbol) -- "
+        "checkpoint explícito de cobertura de coleta de funding, nunca derivado do maior occurred_at já "
+        "persistido em funding_events.",
+     _migrate_to_v6),
 ]
 
 
@@ -456,12 +484,24 @@ def _v5_invariants_satisfied(conn: Connection) -> bool:
     )
 
 
+def _v6_invariants_satisfied(conn: Connection) -> bool:
+    """ALL structural invariants of v6 -- the table AND the unique index on
+    `symbol` (not just the column), since it's the index that actually
+    guarantees at most one checkpoint row per symbol at the database
+    level."""
+    return (
+        _table_exists(conn, "funding_collection_checkpoints")
+        and _has_unique_index_on(conn, "funding_collection_checkpoints", {"symbol"})
+    )
+
+
 _VERSION_INVARIANTS: dict[int, Callable[[Connection], bool]] = {
     1: _v1_invariants_satisfied,
     2: _v2_invariants_satisfied,
     3: _v3_invariants_satisfied,
     4: _v4_invariants_satisfied,
     5: _v5_invariants_satisfied,
+    6: _v6_invariants_satisfied,
 }
 
 

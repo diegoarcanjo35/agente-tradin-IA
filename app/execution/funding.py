@@ -23,6 +23,21 @@ fetch (timeout, rate limit, malformed page, repeated cursor, page cap) --
 it returns `(records_validated_so_far, complete)` so a caller can persist
 real progress without ever claiming a period is fully reconciled when it
 is not.
+
+Correção v1.3 #1/#2: two further gaps closed. (1) `complete=True` used to
+mean only "pagination itself finished cleanly" -- an invalid row (missing
+`funding`, non-numeric, missing `id`/`transactionTime`) was silently
+skipped and the page/window was STILL reported complete, letting a caller
+advance its coverage checkpoint past a record it never actually collected.
+Now ANY invalid row marks the whole window `complete=False` (a structured,
+credential-free diagnostic is logged via `log_event` for each one -- never
+raw payloads). (2) the caller (`Orchestrator._maybe_collect_funding`) no
+longer derives its retomada `since` from the MAX `occurred_at` already
+persisted (unsafe under newest-first pagination -- see
+`app/persistence/repo.py::get_funding_checkpoint`'s docstring for the exact
+reproduced failure) -- it now reads an explicit, separately-persisted
+`FundingCollectionCheckpoint` that only ever advances once an entire
+window is proven complete.
 """
 from __future__ import annotations
 
@@ -34,7 +49,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.errors import ExchangeTimeoutError, RateLimitError
+from app.core.logging import get_logger, log_event
 from app.persistence.models import FundingEvent
+
+logger = get_logger(__name__)
 
 HttpGet = Callable[[str, dict], dict]
 
@@ -70,19 +88,26 @@ class BybitFundingProvider:
     def list_funding(
         self, symbol: str, since: datetime | None = None, until: datetime | None = None,
     ) -> tuple[list[FundingRecord], bool]:
-        """Correção v1.2 #3: walks every page of `/v5/account/transaction-log`
-        (`nextPageCursor`) for the `[since, until]` window, with an explicit
-        page `limit`, a repeated-cursor guard, malformed-page detection, and
-        a defensive page-count cap. Returns `(records, complete)` -- NEVER
-        raises and never discards records already validated before an
-        interruption, so a caller can safely persist partial progress. A
-        row missing/mistyping a required field (`id`, `symbol`, `funding`,
-        `transactionTime`) is silently SKIPPED (never coerced into a
-        fabricated zero) and does not by itself mark the page incomplete --
-        only a transport failure or a broken pagination contract does."""
+        """Correção v1.2 #3 / v1.3 #2: walks every page of
+        `/v5/account/transaction-log` (`nextPageCursor`) for the
+        `[since, until]` window, with an explicit page `limit`, a
+        repeated-cursor guard, malformed-page detection, and a defensive
+        page-count cap. Returns `(records, complete)` -- NEVER raises and
+        never discards records already validated before an interruption,
+        so a caller can safely persist partial progress.
+
+        Correção v1.3 #2: a row missing/mistyping a required field (`id`,
+        `symbol`, `funding`, `transactionTime`) is never turned into a
+        fabricated record AND now marks the ENTIRE window `complete=False`
+        -- before this correction, an invalid row was silently skipped
+        while pagination itself still reported success, letting a caller
+        advance its coverage checkpoint past a record it never actually
+        collected. A structured (credential/payload-free) diagnostic is
+        logged for each invalid row via `log_event`."""
         records: list[FundingRecord] = []
         cursor: str | None = None
         seen_cursors: set[str] = set()
+        complete = True
 
         base_params: dict = {"category": "linear", "symbol": symbol, "type": "SETTLEMENT"}
         if since is not None:
@@ -105,13 +130,16 @@ class BybitFundingProvider:
                 return records, False
 
             for row in rows:
-                record = self._parse_row(row, symbol)
-                if record is not None:
-                    records.append(record)
+                record, error_reason = self._parse_row(row, symbol)
+                if error_reason is not None:
+                    complete = False
+                    log_event(logger, 30, "funding_row_invalid", reason=error_reason)
+                    continue
+                records.append(record)
 
             next_cursor = result.get("nextPageCursor")
             if not next_cursor:
-                return records, True
+                return records, complete
             if next_cursor in seen_cursors:
                 return records, False
             seen_cursors.add(next_cursor)
@@ -120,20 +148,34 @@ class BybitFundingProvider:
         return records, False
 
     @staticmethod
-    def _parse_row(row: dict, symbol: str) -> FundingRecord | None:
-        """Correção v1.2 #3: validates presence/type of every required
-        field before ever producing a record -- an invalid row is skipped
-        entirely, never transformed into a fabricated zero-amount record."""
+    def _parse_row(row: dict, symbol: str) -> tuple[FundingRecord | None, str | None]:
+        """Correção v1.2 #3 / v1.3 #2: validates presence/type of every
+        required field before ever producing a record. Returns
+        `(record, None)` on success or `(None, reason)` on failure --
+        `reason` is a short, structured, credential/payload-free diagnostic
+        string (never the raw row) suitable for logging."""
         try:
             funding_id = str(row["id"])
-            row_symbol = row.get("symbol") or symbol
+        except (KeyError, TypeError):
+            return None, "id ausente ou de tipo inválido"
+        if not funding_id:
+            return None, "id vazio"
+
+        row_symbol = row.get("symbol") or symbol
+        if not row_symbol:
+            return None, f"symbol ausente (id={funding_id})"
+
+        try:
             amount = float(row["funding"])
+        except (KeyError, TypeError, ValueError):
+            return None, f"campo funding ausente ou não numérico (id={funding_id})"
+
+        try:
             occurred_at = datetime.fromtimestamp(int(row["transactionTime"]) / 1000, tz=timezone.utc)
         except (KeyError, TypeError, ValueError):
-            return None
-        if not funding_id or not row_symbol:
-            return None
-        return FundingRecord(funding_id=funding_id, symbol=row_symbol, amount=amount, occurred_at=occurred_at)
+            return None, f"transactionTime ausente ou inválido (id={funding_id})"
+
+        return FundingRecord(funding_id=funding_id, symbol=row_symbol, amount=amount, occurred_at=occurred_at), None
 
 
 def record_new_funding_events(session: Session, records: list[FundingRecord]) -> list[FundingEvent]:

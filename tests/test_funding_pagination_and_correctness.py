@@ -99,7 +99,11 @@ def test_funding_invalid_row_is_skipped_never_coerced_to_zero():
 
     records, complete = provider.list_funding("BTCUSDT")
 
-    assert complete is True
+    # Correção v1.3 #2: an invalid row now marks the whole window
+    # incomplete -- it is no longer silently skipped while pagination
+    # reports success, which used to let a caller advance its coverage
+    # checkpoint past a record it never actually collected.
+    assert complete is False
     assert len(records) == 1  # only the valid row -- never a fabricated zero for the bad ones
     assert records[0].amount == -1.0
 
@@ -114,13 +118,12 @@ def test_orchestrator_splits_a_large_gap_into_multiple_time_windows(tmp_path):
     transport = FakeBybitTransport()
     orch = build_orchestrator(settings, bybit_transport=transport)
 
-    # Seed a funding event far in the past so `since` forces a multi-window walk.
-    from app.execution.funding import FundingRecord, record_new_funding_events
-    old_occurred_at = utcnow() - timedelta(seconds=FUNDING_WINDOW_SECONDS * 2.5)
+    # Seed a checkpoint far in the past so `since` forces a multi-window
+    # walk (correção v1.3 #1: the checkpoint, never a funding_events row,
+    # is what drives retomada).
+    old_covered_until = utcnow() - timedelta(seconds=FUNDING_WINDOW_SECONDS * 2.5)
     with session_scope(orch.session_factory) as session:
-        record_new_funding_events(session, [
-            FundingRecord("F-OLD", "BTCUSDT", -0.1, old_occurred_at),
-        ])
+        repo.advance_funding_checkpoint(session, "BTCUSDT", old_covered_until)
 
     # Each window's fetch pops exactly one page (no cursor -> complete);
     # queue three distinct pages for the (at least) 3 windows this gap spans.
@@ -143,10 +146,12 @@ def test_orchestrator_splits_a_large_gap_into_multiple_time_windows(tmp_path):
 
         from app.persistence.models import FundingEvent
 
-        # F-OLD (seed) + whatever windows successfully collected.
         total_ids = set(session.execute(select(FundingEvent.funding_id)).scalars().all())
-        assert "F-OLD" in total_ids
         assert {"F-101", "F-102", "F-103"} <= total_ids
+
+        checkpoint = repo.get_funding_checkpoint(session, "BTCUSDT")
+        assert checkpoint is not None
+        assert checkpoint.covered_until > old_covered_until
 
 
 def test_orchestrator_stops_at_first_incomplete_window_and_never_skips_ahead(tmp_path):
@@ -156,10 +161,9 @@ def test_orchestrator_stops_at_first_incomplete_window_and_never_skips_ahead(tmp
     transport = FakeBybitTransport()
     orch = build_orchestrator(settings, bybit_transport=transport)
 
-    from app.execution.funding import FundingRecord, record_new_funding_events
-    old_occurred_at = utcnow() - timedelta(seconds=FUNDING_WINDOW_SECONDS * 2.5)
+    old_covered_until = utcnow() - timedelta(seconds=FUNDING_WINDOW_SECONDS * 2.5)
     with session_scope(orch.session_factory) as session:
-        record_new_funding_events(session, [FundingRecord("F-OLD-2", "BTCUSDT", -0.1, old_occurred_at)])
+        repo.advance_funding_checkpoint(session, "BTCUSDT", old_covered_until)
 
     from app.core.errors import ExchangeTimeoutError
     transport.queue_funding_pages([
@@ -184,6 +188,11 @@ def test_orchestrator_stops_at_first_incomplete_window_and_never_skips_ahead(tmp
         ids = {r for r in session.execute(select(FundingEvent.funding_id)).scalars().all()}
         assert "F-201" in ids  # window 1's progress preserved
         assert "F-203" not in ids  # window 3 never collected -- no skipping ahead of the failure
+
+        checkpoint = repo.get_funding_checkpoint(session, "BTCUSDT")
+        assert checkpoint is not None
+        window1_end = old_covered_until + timedelta(seconds=FUNDING_WINDOW_SECONDS)
+        assert checkpoint.covered_until == window1_end  # advanced exactly through window 1, no further
 
 
 def test_net_profit_metric_uses_exactly_the_sum_of_persisted_funding_field(session_factory):
