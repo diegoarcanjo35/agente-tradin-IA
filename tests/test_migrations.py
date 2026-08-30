@@ -585,3 +585,195 @@ def test_fully_current_database_is_idempotent_under_strict_invariant_checking(tm
     report_again = run_migrations(engine)
     assert report_again.applied == []
     assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
+
+
+# --- Correction v1.5 #2: non-contiguous/incomplete recorded history --------
+#
+# `_find_diverged_version()` used to only re-check versions that HAD a row in
+# `schema_migrations` -- a database stamped with ONLY `version=2` and no `v1`
+# row was accepted as valid v2 even though it never actually satisfied v1's
+# own invariants. `_validate_recorded_history()` replaces it: the recorded
+# set must be exactly the contiguous range {1..max}, an unknown/future
+# version halts safely, and validation of the max version checks the
+# CUMULATIVE invariants of every version up to it, not just its own.
+
+def _stamp_only_versions(engine, versions: list[int]) -> None:
+    """Writes `schema_migrations` rows for exactly `versions` (and no
+    others) -- simulates a history that skips versions, unlike
+    `run_migrations()` which always records every intermediate version."""
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at TEXT NOT NULL)"
+        ))
+        for v in versions:
+            conn.execute(
+                text("INSERT INTO schema_migrations (version, description, applied_at) VALUES (:v, 'stub', :t)"),
+                {"v": v, "t": _now_iso()},
+            )
+
+
+def test_only_v2_recorded_with_v1_invariants_missing_is_rejected(tmp_path):
+    """Exact reproduction from the audit: a database whose ONLY recorded
+    migration is `version=2`, with v2's own structural invariants present
+    (clock_out_of_sync, the candles unique index) but v1's invariants
+    (orders.is_close) absent, must be rejected -- never silently accepted
+    as a valid v2 just because the highest recorded version has a row."""
+    engine = _make_legacy_v0_engine(tmp_path, name="only_v2_no_v1.db")
+    with engine.begin() as conn:
+        # v2's own invariants -- present.
+        conn.execute(text("ALTER TABLE system_state ADD COLUMN clock_out_of_sync BOOLEAN NOT NULL DEFAULT 0"))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX uq_candle_symbol_timeframe_open_time ON candles (symbol, timeframe, open_time)"
+        ))
+        # v1's invariants -- deliberately absent: no state_ambiguous, no
+        # orders.is_close, orders.stop_loss still NOT NULL.
+    _stamp_only_versions(engine, [2])
+
+    with pytest.raises(SchemaDivergenceError) as excinfo:
+        current_schema_version(engine)
+    assert "contíguo" in str(excinfo.value).lower() or "não contí" in str(excinfo.value).lower()
+
+    with pytest.raises(SchemaDivergenceError):
+        run_migrations(engine)
+
+
+def test_only_v2_recorded_but_structurally_complete_is_still_rejected_for_incomplete_history(tmp_path):
+    """Even when the real schema happens to be FULLY structurally complete
+    (all v1 and v2 invariants genuinely hold), a history that skips
+    straight to `version=2` without a `version=1` row is still rejected --
+    the documented policy chosen for this correction is to require an
+    explicit, complete, contiguous history rather than silently repairing
+    or trusting a structurally-lucky-but-incomplete record."""
+    engine = _make_legacy_v0_engine(tmp_path, name="only_v2_structurally_complete.db")
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE system_state ADD COLUMN state_ambiguous BOOLEAN NOT NULL DEFAULT 0"))
+        conn.execute(text("ALTER TABLE system_state ADD COLUMN clock_out_of_sync BOOLEAN NOT NULL DEFAULT 0"))
+        conn.execute(text(
+            "CREATE TABLE orders_tmp (id INTEGER PRIMARY KEY AUTOINCREMENT, idempotency_key VARCHAR(128) NOT NULL, "
+            "risk_evaluation_id INTEGER NOT NULL, symbol VARCHAR(32) NOT NULL, side VARCHAR(8) NOT NULL, "
+            "qty FLOAT NOT NULL, stop_loss FLOAT, take_profit FLOAT, is_close BOOLEAN NOT NULL DEFAULT 0, "
+            "status VARCHAR(16) NOT NULL, exchange_order_id VARCHAR(128), mode VARCHAR(16) NOT NULL, "
+            "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+        ))
+        conn.execute(text(
+            "INSERT INTO orders_tmp SELECT id, idempotency_key, risk_evaluation_id, symbol, side, qty, "
+            "stop_loss, take_profit, 0, status, exchange_order_id, mode, created_at, updated_at FROM orders"
+        ))
+        conn.execute(text("DROP TABLE orders"))
+        conn.execute(text("ALTER TABLE orders_tmp RENAME TO orders"))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX uq_candle_symbol_timeframe_open_time ON candles (symbol, timeframe, open_time)"
+        ))
+    _stamp_only_versions(engine, [2])  # no v1 row, despite v1's invariants genuinely holding too
+
+    with pytest.raises(SchemaDivergenceError) as excinfo:
+        current_schema_version(engine)
+    assert "contíguo" in str(excinfo.value).lower() or "não contí" in str(excinfo.value).lower()
+
+
+def test_history_with_a_gap_1_and_3_is_rejected(tmp_path):
+    """A recorded history of {1, 3} (skipping the unknown/never-defined
+    version 2's neighbor and jumping to a version this app doesn't even
+    know) is rejected both for the gap and for the unknown version."""
+    engine = _make_legacy_v0_engine(tmp_path, name="gap_1_3.db")
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE system_state ADD COLUMN state_ambiguous BOOLEAN NOT NULL DEFAULT 0"))
+    _stamp_only_versions(engine, [1, 3])
+
+    with pytest.raises(SchemaDivergenceError):
+        current_schema_version(engine)
+    with pytest.raises(SchemaDivergenceError):
+        run_migrations(engine)
+
+
+def test_version_higher_than_current_schema_version_is_rejected_as_implicit_downgrade(tmp_path):
+    """A recorded version beyond CURRENT_SCHEMA_VERSION must halt safely --
+    this app must never treat an unknown future version, or an implicit
+    downgrade away from it, as something it can proceed past."""
+    engine = _make_legacy_v0_engine(tmp_path, name="future_version.db")
+    _stamp_only_versions(engine, [1, 2, 3])  # v3 doesn't exist in this app
+
+    with pytest.raises(SchemaDivergenceError) as excinfo:
+        current_schema_version(engine)
+    assert "superior" in str(excinfo.value).lower() or "v3" in str(excinfo.value)
+
+    with pytest.raises(SchemaDivergenceError):
+        run_migrations(engine)
+
+
+def test_migration_that_does_not_produce_promised_invariants_is_never_recorded(tmp_path, monkeypatch):
+    """A migration function that runs to completion WITHOUT raising, but
+    fails to actually produce everything its version promises, must not be
+    trusted just because no exception was thrown -- it is never recorded as
+    applied, and the whole transaction is rolled back."""
+    import app.persistence.migrations as migrations_module
+
+    engine = _make_legacy_v0_engine(tmp_path, name="promises_not_kept.db")
+    data_before = _row_counts(engine)
+
+    def _adds_state_ambiguous_but_forgets_orders(conn):
+        # Only does HALF of what v1 promises -- state_ambiguous is added,
+        # but orders.is_close/nullable stop_loss are never touched.
+        conn.execute(text("ALTER TABLE system_state ADD COLUMN state_ambiguous BOOLEAN NOT NULL DEFAULT 0"))
+
+    monkeypatch.setitem(
+        migrations_module.__dict__, "MIGRATIONS",
+        [(1, "migração incompleta (não levanta exceção, mas não cumpre o prometido)",
+          _adds_state_ambiguous_but_forgets_orders)],
+    )
+
+    with pytest.raises(MigrationError) as excinfo:
+        run_migrations(engine)
+    assert "invariantes" in str(excinfo.value).lower()
+
+    with engine.connect() as conn:
+        if _table_exists(conn, "schema_migrations"):
+            applied = conn.execute(text("SELECT version FROM schema_migrations")).fetchall()
+            assert applied == []  # never recorded despite not raising mid-ALTER
+        cols = {r[1] for r in conn.execute(text("PRAGMA table_info(system_state)")).fetchall()}
+        assert "state_ambiguous" not in cols  # rolled back along with everything else
+
+    assert _row_counts(engine) == data_before
+
+
+def test_partial_legacy_schema_with_no_history_migrates_and_validates_correctly(tmp_path):
+    """A legacy database with no `schema_migrations` table at all, and a
+    hand-modified PARTIAL structural state (v1 fully satisfied, v2 only
+    half-satisfied: clock_out_of_sync present but the unique index still
+    missing) must be correctly detected as v1 via cumulative invariant
+    checking, and migrating it must apply only migration 2 and end up fully
+    valid -- not skip straight to "looks like v2" from one column alone."""
+    engine = _make_legacy_v0_engine(tmp_path, name="partial_legacy_no_history.db")
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE system_state ADD COLUMN state_ambiguous BOOLEAN NOT NULL DEFAULT 0"))
+        conn.execute(text("ALTER TABLE orders ADD COLUMN is_close BOOLEAN NOT NULL DEFAULT 0"))
+        conn.execute(text("ALTER TABLE system_state ADD COLUMN clock_out_of_sync BOOLEAN NOT NULL DEFAULT 0"))
+        # stop_loss still NOT NULL and no unique index -- v1 and v2 both
+        # genuinely incomplete despite clock_out_of_sync's presence.
+
+    assert current_schema_version(engine) == 0  # stop_loss still NOT NULL -> not even v1 yet
+
+    report = run_migrations(engine)
+    assert report.starting_version == 0
+    assert report.applied == [1, 2]
+    assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
+    with engine.connect() as conn:
+        assert conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type='index' AND name='uq_candle_symbol_timeframe_open_time'")
+        ).fetchone() is not None
+
+
+def test_consistent_current_database_remains_idempotent_under_full_history_validation(tmp_path):
+    """A genuinely consistent, fully-recorded, contiguous v2 database must
+    continue to validate cleanly and stay idempotent under the new full
+    ancestral-chain check -- correction v1.5 #2 tightens what counts as
+    valid, but must never reject a database that was always legitimately
+    consistent."""
+    engine = _make_legacy_v0_engine(tmp_path, name="consistent_v2.db")
+    run_migrations(engine)
+
+    assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
+    report_again = run_migrations(engine)
+    assert report_again.applied == []
+    assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION

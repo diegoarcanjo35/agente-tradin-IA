@@ -73,12 +73,12 @@ Prova adversarial reproduzindo o cenário exato do auditor (ALTER real,
 depois falha, checagem de esquema E dados completos antes/depois):
 `tests/test_migrations.py::test_alter_table_add_column_is_rolled_back_on_later_failure`.
 
-## Divergência de esquema (correção v1.4 #3)
+## Divergência de esquema (correções v1.4 #3 e v1.5 #2)
 
 `schema_migrations` registrar uma versão como aplicada não é, por si só,
-confiável — a cada execução, `run_migrations()` re-valida TODOS os
-invariantes estruturais de cada versão já registrada (não apenas uma coluna
-sentinela) contra o esquema real:
+confiável — a cada execução, `run_migrations()`/`current_schema_version()`
+re-validam TODOS os invariantes estruturais de cada versão (não apenas uma
+coluna sentinela) contra o esquema real:
 
 - **v1**: `system_state.state_ambiguous` existe; `orders.is_close` existe;
   `orders.stop_loss` aceita `NULL` (checado via `PRAGMA table_info`, não só
@@ -88,13 +88,49 @@ sentinela) contra o esquema real:
   **estrutura** (colunas cobertas), nunca por um nome fixo, então um índice
   criado por outra ferramenta com nome diferente ainda conta.
 
-Se uma versão registrada não satisfizer integralmente seus invariantes, a
-aplicação **para com `SchemaDivergenceError`**, em português, e não altera
-nada automaticamente — reparo automático de um esquema já divergente foi
-considerado arriscado demais (poderia mascarar corrupção real). Nesse caso,
-inspecione manualmente o banco (`PRAGMA table_info`/`PRAGMA index_list`) e
-decida entre reparar manualmente o esquema para bater com a versão
-registrada, ou restaurar de um backup.
+### Cadeia ancestral completa, não só a versão mais alta (correção v1.5 #2)
+
+Uma auditoria reproduziu um banco cuja `schema_migrations` continha
+**apenas** a linha `version=2` — com os invariantes estruturais de v2
+presentes (`clock_out_of_sync`, o índice único), mas os de v1 ausentes
+(sem `orders.is_close`). A verificação antiga (`_find_diverged_version`)
+só re-validava versões que já TINHAM uma linha registrada — como não havia
+linha para v1, seus invariantes nunca eram checados, e o banco era aceito
+como v2 válido incorretamente.
+
+`_validate_recorded_history()` substitui essa checagem e passa a exigir,
+para toda versão máxima registrada `N`:
+
+1. **Nenhuma versão desconhecida ou futura**: `N > CURRENT_SCHEMA_VERSION`
+   interrompe a inicialização com `SchemaDivergenceError` — nunca um
+   downgrade implícito nem uma versão que esta aplicação não conhece.
+2. **Histórico exatamente contíguo**: o conjunto de versões registradas
+   deve ser exatamente `{1, 2, ..., N}`. Um histórico incompleto (por
+   exemplo, só `{2}`, ou `{1, 3}` pulando uma versão) é rejeitado mesmo que
+   a versão mais alta tenha uma linha registrada — e mesmo que o esquema
+   real, por coincidência, já satisfaça estruturalmente todas as versões
+   (política escolhida: nunca confiar em um histórico incompleto, mesmo
+   "sortudo").
+3. **Invariantes cumulativos**: a validação da versão `N`
+   (`_cumulative_invariants_satisfied`) verifica os invariantes de
+   **todas** as versões de `1` até `N`, não apenas os introduzidos em `N`.
+
+Além disso, `run_migrations()` agora valida os invariantes cumulativos de
+cada migração **imediatamente depois de executá-la e antes de registrá-la**
+como aplicada — uma migração que roda sem lançar exceção mas não produz
+tudo o que promete nunca é registrada como bem-sucedida — e faz uma
+**validação final completa** do esquema resultante antes de retornar
+sucesso. `current_schema_version()` passa pela mesma validação de histórico
+completo antes de informar uma versão registrada como válida.
+
+Se qualquer uma dessas checagens falhar, a aplicação **para com
+`SchemaDivergenceError`**, em português, e não altera nada automaticamente
+— reparo automático de um esquema já divergente foi considerado arriscado
+demais (poderia mascarar corrupção real). Nesse caso, inspecione
+manualmente o banco (`PRAGMA table_info`/`PRAGMA index_list`,
+`SELECT * FROM schema_migrations`) e decida entre reparar manualmente o
+esquema/histórico para bater com a versão registrada, ou restaurar de um
+backup.
 
 ## Deduplicação de candles (migration 2)
 

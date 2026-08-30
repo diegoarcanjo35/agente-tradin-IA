@@ -267,34 +267,103 @@ def _invariants_satisfied_for_version(conn: Connection, version: int) -> bool:
 def _detect_legacy_version(conn: Connection) -> int:
     """For a database with tables but no schema_migrations history yet,
     validates ALL structural invariants of each version (never a single
-    sentinel column) to determine which baseline it already matches."""
-    if not _v1_invariants_satisfied(conn):
-        return 0
-    if not _v2_invariants_satisfied(conn):
-        return 1
-    return 2
+    sentinel column), version by version in ascending order, to determine
+    which baseline it already matches. Stops at the first version whose
+    invariants don't hold -- since each version's own check already implies
+    every earlier one held (this loop only ever advances after the
+    previous version's check passed), the result is inherently the highest
+    version whose CUMULATIVE invariants (1..that version) are satisfied."""
+    version = 0
+    for candidate in range(1, CURRENT_SCHEMA_VERSION + 1):
+        if not _invariants_satisfied_for_version(conn, candidate):
+            break
+        version = candidate
+    return version
 
 
-def _find_diverged_version(conn: Connection, recorded_versions: set[int]) -> int | None:
-    """Correction v1.4 #3: schema_migrations recording a version as applied
-    is not, by itself, trusted -- every recorded version's invariants are
-    re-checked against the REAL schema every run. Returns the lowest
-    recorded version whose invariants do not actually hold, or None if
-    every recorded version checks out."""
-    for version in sorted(recorded_versions):
-        if not _invariants_satisfied_for_version(conn, version):
-            return version
-    return None
+def _cumulative_invariants_satisfied(conn: Connection, version: int) -> bool:
+    """Correction v1.5 #2: a database only genuinely satisfies version N if
+    EVERY invariant from v1 through vN holds -- not merely the invariants
+    introduced at N itself. A database stamped only `version=2` with v2's
+    own columns/index present but v1's `orders.is_close` missing must NOT
+    be treated as valid v2."""
+    return all(_invariants_satisfied_for_version(conn, v) for v in range(1, version + 1))
+
+
+def _validate_recorded_history(conn: Connection, recorded_versions: set[int]) -> None:
+    """Correction v1.5 #2: schema_migrations recording versions as applied
+    is not, by itself, trusted. Unlike the earlier per-version check this
+    replaces, this validates the FULL ancestral chain, not just whichever
+    versions happen to have a row:
+
+    - a recorded version newer than CURRENT_SCHEMA_VERSION halts safely
+      (never treat an unknown/future version, or an implicit downgrade
+      away from it, as valid);
+    - the recorded set must be EXACTLY the contiguous range {1..N} for the
+      max recorded version N -- a gap (e.g. only v2, or {1, 3}) is rejected
+      as an incomplete history, never silently accepted just because the
+      highest version has a row;
+    - the CUMULATIVE structural invariants of 1..N must hold against the
+      real schema, not just N's own.
+
+    Never repairs anything automatically -- same policy as before
+    (correction v1.4 #3): refuse and require manual intervention, since
+    auto-"fixing" an already-divergent database risks masking real
+    corruption."""
+    if not recorded_versions:
+        return
+    max_version = max(recorded_versions)
+
+    if max_version > CURRENT_SCHEMA_VERSION:
+        raise SchemaDivergenceError(
+            f"schema_migrations registra a versão v{max_version}, superior à versão máxima "
+            f"conhecida por esta aplicação (v{CURRENT_SCHEMA_VERSION}). Isso indica que o banco foi "
+            f"criado ou migrado por uma versão mais nova do sistema, ou por engano. Por segurança, "
+            f"nenhuma alteração automática (incluindo qualquer downgrade implícito) foi feita -- "
+            f"intervenção manual é necessária antes de reiniciar a aplicação. Ver docs/MIGRACOES.md, "
+            f"seção 'Divergência de esquema'."
+        )
+
+    expected = set(range(1, max_version + 1))
+    if recorded_versions != expected:
+        missing = sorted(expected - recorded_versions)
+        raise SchemaDivergenceError(
+            f"Histórico de migrações não contíguo: schema_migrations registra as versões "
+            f"{sorted(recorded_versions)}, mas a versão máxima registrada (v{max_version}) exigiria "
+            f"exatamente {sorted(expected)} (faltando: {missing}). Um histórico incompleto nunca é "
+            f"aceito só porque a versão mais alta tem uma linha registrada. Por segurança, nenhuma "
+            f"alteração automática foi feita -- intervenção manual é necessária antes de reiniciar a "
+            f"aplicação. Ver docs/MIGRACOES.md, seção 'Divergência de esquema'."
+        )
+
+    if not _cumulative_invariants_satisfied(conn, max_version):
+        raise SchemaDivergenceError(
+            f"Inconsistência de esquema detectada: schema_migrations registra até a versão "
+            f"v{max_version} como aplicada, mas o esquema real do banco não satisfaz todos os "
+            f"invariantes estruturais cumulativos de v1 até v{max_version} (colunas, nulabilidade ou "
+            f"índices únicos ausentes/divergentes em alguma versão da cadeia -- não apenas na mais "
+            f"recente). Isso pode indicar uma migração anterior malsucedida, uma alteração manual do "
+            f"banco, ou corrupção. Por segurança, nenhuma alteração automática foi feita -- "
+            f"intervenção manual é necessária antes de reiniciar a aplicação. Ver docs/MIGRACOES.md, "
+            f"seção 'Divergência de esquema'."
+        )
 
 
 def current_schema_version(engine: Engine) -> int:
+    """Correction v1.5 #2: never reports a recorded version as valid when
+    the chain or the schema is actually divergent -- validates the full
+    recorded history the same way run_migrations() does, rather than
+    trusting `max(applied)` at face value."""
     with engine.connect() as conn:
         if not _table_exists(conn, "schema_migrations"):
             if not _table_exists(conn, "system_state"):
                 return 0
             return _detect_legacy_version(conn)
         applied = _applied_versions(conn)
-        return max(applied) if applied else _detect_legacy_version(conn)
+        if not applied:
+            return _detect_legacy_version(conn)
+        _validate_recorded_history(conn, applied)
+        return max(applied)
 
 
 def run_migrations(engine: Engine) -> MigrationReport:
@@ -310,18 +379,7 @@ def run_migrations(engine: Engine) -> MigrationReport:
             starting_version = max(already_applied) if already_applied else None
 
             if already_applied:
-                diverged = _find_diverged_version(conn, already_applied)
-                if diverged is not None:
-                    raise SchemaDivergenceError(
-                        f"Inconsistência de esquema detectada: schema_migrations registra a "
-                        f"versão v{diverged} como aplicada, mas o esquema real do banco não "
-                        f"satisfaz todos os invariantes estruturais dessa versão (colunas, "
-                        f"nulabilidade ou índices únicos ausentes/divergentes). Isso pode "
-                        f"indicar uma migração anterior malsucedida, uma alteração manual do "
-                        f"banco, ou corrupção. Por segurança, nenhuma alteração automática foi "
-                        f"feita -- intervenção manual é necessária antes de reiniciar a "
-                        f"aplicação. Ver docs/MIGRACOES.md, seção 'Divergência de esquema'."
-                    )
+                _validate_recorded_history(conn, already_applied)
 
             brand_new = not _table_exists(conn, "system_state")
             if brand_new:
@@ -361,10 +419,35 @@ def run_migrations(engine: Engine) -> MigrationReport:
                         f"Nenhuma alteração foi confirmada; o banco permanece na versão "
                         f"{starting_version}. Causa original: {exc}"
                     ) from exc
+
+                # Correction v1.5 #2: validate this version's CUMULATIVE
+                # invariants (1..version) against the real schema BEFORE
+                # recording it as applied -- a migration that runs without
+                # raising but doesn't actually produce everything it
+                # promises must never be stamped as successful.
+                if not _cumulative_invariants_satisfied(conn, version):
+                    raise MigrationError(
+                        f"A migração v{version} ({description}) foi executada sem levantar "
+                        f"exceção, mas o esquema resultante não satisfaz todos os invariantes "
+                        f"estruturais cumulativos esperados até essa versão. Por segurança, a "
+                        f"versão NÃO foi registrada como aplicada e toda a transação será "
+                        f"revertida; o banco permanece na versão {starting_version}."
+                    )
                 _record_migration(conn, version, description)
                 applied_now.append(version)
 
             ending_version = max(starting_version, max(applied_now, default=starting_version))
+
+            # Final full re-validation before declaring success: the
+            # schema actually reachable at `ending_version` must satisfy
+            # every cumulative invariant from v1 through it.
+            if not _cumulative_invariants_satisfied(conn, ending_version):
+                raise MigrationError(
+                    f"Validação final falhou: o esquema não satisfaz os invariantes estruturais "
+                    f"cumulativos esperados até a versão v{ending_version} depois da execução das "
+                    f"migrações. Nenhuma alteração foi confirmada."
+                )
+
             return MigrationReport(
                 starting_version=starting_version, ending_version=ending_version,
                 applied=applied_now, stamped_only=False,

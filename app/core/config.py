@@ -4,6 +4,7 @@ the API surface, per the non-negotiable "no Demo/Real switch" requirement.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 
@@ -120,6 +121,13 @@ class Settings(BaseSettings):
     # touch a real rate-limited API.
     bybit_poll_interval_seconds: float = Field(default=5.0)
     replay_poll_interval_seconds: float = Field(default=0.02)
+
+    # Correction v1.5 #1: explicit first-boot policy for market data backlog
+    # draining. When set, a provider with no persisted cursor yet anchors to
+    # this timestamp instead of the default "most recent closed candle at
+    # boot" baseline (see app/market_data/bybit_provider.py). Never implies
+    # an unbounded "recover all history" attempt either way.
+    market_data_initial_start: datetime | None = Field(default=None)
 
     # Risk defaults (conservative). See app/risk/config.py for the dataclass
     # these seed and full documentation of each limit.

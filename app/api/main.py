@@ -103,6 +103,7 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator:
 
         market_data_provider = BybitDemoMarketDataProvider(
             settings.bybit_base_url, settings.symbol, "1", http_get=transport.http_get,
+            initial_start=settings.market_data_initial_start,
         )
         execution_engine = BybitDemoExecutionEngine(
             settings.bybit_base_url, http_post=transport.http_post, http_get=transport.http_get,

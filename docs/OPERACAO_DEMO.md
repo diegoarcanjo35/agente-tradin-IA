@@ -87,7 +87,7 @@ constraint única (`symbol, timeframe, open_time`) como defesa adicional —
 apenas retorna `None` e a tick é ignorada sem criar sinal/IA/avaliação de
 risco duplicados.
 
-### Seleção do candle fechado anterior e paginação do backlog (correções v1.3 #2 e v1.4 #2)
+### Seleção do candle fechado anterior e paginação do backlog (correções v1.3 #2, v1.4 #2 e v1.5 #1)
 
 A Bybit retorna as linhas de kline **da mais nova para a mais antiga**, e a
 mais nova é frequentemente um candle ainda em formação — consultar com
@@ -95,22 +95,57 @@ mais nova é frequentemente um candle ainda em formação — consultar com
 (auditoria v1.4) perder candles fechados mais antigos que a janela de uma
 única resposta quando o backlog pendente era maior que o `limit` pedido.
 
-`BybitDemoMarketDataProvider` agora **pagina** para frente a partir de um
-cursor (`app/market_data/bybit_provider.py::_refill_queue`): consulta com
-`start = cursor + intervalo` e `limit = page_size` (padrão 200), interpreta
-todas as linhas recebidas (independente da ordem devolvida), aceita apenas
-as fechadas e ainda não processadas, e continua pedindo páginas seguintes
-(até `max_pages_per_poll`, padrão 10 — um limite de segurança por chamada,
-não um teto de quanto backlog pode ser drenado no total: a próxima chamada
-simplesmente continua de onde parou) até alcançar o presente. Candles são
-enfileirados internamente e entregues **um por `next_candle()`**, sempre em
-ordem cronológica.
+**Contrato oficial e a correção v1.5 #1**: a documentação do endpoint
+`GET /v5/market/kline` garante que `limit` é aplicado sobre o conjunto
+GLOBAL de resultados ordenado por `startTime` decrescente — **não** garante
+que uma consulta apenas com `start` devolva as linhas mais antigas do
+intervalo. Uma auditoria reproduziu exatamente essa falha com um double de
+teste fiel a esse contrato (filtra por `start`, ordena TODOS os candidatos
+decrescente, só então aplica `limit`): com backlog de 17 candles fechados e
+página de 5, o provider antigo (que consultava só `start`) entregava apenas
+os 5 candles mais NOVOS do intervalo aberto, perdendo silenciosamente os 12
+mais antigos.
+
+`BybitDemoMarketDataProvider` agora **nunca** consulta com `start` sozinho.
+Toda página histórica (`app/market_data/bybit_provider.py::_refill_queue`)
+usa uma janela limitada `[start, end]`, calculada a partir do cursor e do
+`page_size`, dimensionada para que uma única janela jamais contenha mais
+candles fechados do que `page_size` — a garantia vem do tamanho da janela
+em si, nunca da ordem em que o servidor devolve as linhas. Cada linha
+recebida é reordenada localmente e revalidada quanto à continuidade
+(exatamente um intervalo após a anterior) independente da ordem devolvida
+pelo servidor. Candles são enfileirados internamente e entregues **um por
+`next_candle()`**, sempre em ordem cronológica, até `max_pages_per_poll`
+janelas por chamada (padrão 10 — um limite de segurança por chamada, não um
+teto de quanto backlog pode ser drenado no total: a próxima chamada
+simplesmente continua de onde parou).
 
 O cursor (`_last_processed_open_time`) só avança conforme candles são
 efetivamente **entregues** pelo provider, nunca apenas buscados — uma falha
 de rede no meio da paginação preserva o progresso já confirmado (os candles
 já obtidos ficam na fila) e a próxima tentativa continua exatamente do
 mesmo ponto, sem lacuna nem duplicata.
+
+**Política do primeiro boot sem cursor persistido (correção v1.5 #1)**: o
+provider nunca alega recuperar "todo o histórico" quando ainda não existe
+nenhum cursor persistido (nem via banco, nem via `sync_cursor`). Duas
+políticas explícitas e determinísticas, nunca uma recuperação irrestrita:
+
+- se `MARKET_DATA_INITIAL_START` estiver configurado (`Settings
+  .market_data_initial_start`), o provider ancora o primeiro candle
+  exatamente nesse instante — nunca antes dele;
+- caso contrário (padrão), o provider consulta **uma única** janela
+  limitada de retrocesso (`page_size` candles de largura) a partir de
+  "agora" e entrega apenas os candles fechados encontrados dentro dela, do
+  mais antigo ao mais novo — nunca os candles mais antigos que ficam fora
+  dessa janela.
+
+Em ambos os casos, toda consulta ao primeiro boot também carrega `start` e
+`end`, e o baseline escolhido é registrado em log
+(`market_data_bootstrap_configured_start` / `market_data_bootstrap_baseline`).
+Uma vez que qualquer candle é persistido, `sync_cursor()` (alimentado pelo
+banco) sempre tem prioridade sobre essa política de primeiro boot em
+qualquer reinício futuro do processo.
 
 **Cursor persistente**: a cada `tick()`, o `Orchestrator` consulta o
 `open_time` do último candle realmente persistido em `candles`
@@ -128,9 +163,11 @@ explícita — nunca pula silenciosamente a lacuna. O `Orchestrator` marca
 loop de polling continua vivo (só `REPLAY_FINISHED` o encerra).
 
 Coberto por `tests/test_closed_candle_selection.py` (seleção básica) e
-`tests/test_candle_backlog_pagination.py` (backlog maior que uma página,
-ordem embaralhada, falha entre páginas, lacuna, reinício com cursor
-persistido).
+`tests/test_candle_backlog_pagination.py` (contrato de ordenação
+global-decrescente-depois-limit do fake, backlog de 17 candles com cursor
+persistido, presença obrigatória de `start`/`end`, ordem embaralhada, falha
+entre janelas, lacuna, reinício com cursor persistido, primeiro boot com e
+sem `MARKET_DATA_INITIAL_START`).
 
 ## Testando o kill switch
 
