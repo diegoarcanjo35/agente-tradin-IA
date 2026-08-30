@@ -143,11 +143,20 @@ class Settings(BaseSettings):
     log_max_bytes: int = Field(default=5_000_000)
     log_backup_count: int = Field(default=5)
 
-    # The control API (kill switch engage/disengage) has NO authentication in
-    # this phase -- see docs/SEGURANCA.md. Binding anywhere but localhost is
-    # refused unless explicitly and separately opted into.
+    # Correction v1.3 #3: `api_host`/`api_port` are only meaningful when the
+    # app is started through the official launcher (app/run.py), which is
+    # the only code path that actually passes them to uvicorn -- a raw
+    # `uvicorn app.api.main:app --host ...` invocation bypasses Python
+    # entirely and this app has no way to observe or veto that. As a second,
+    # independent layer that holds regardless of how the process was
+    # started, the control endpoints (kill switch) require CONTROL_API_TOKEN
+    # for any request that isn't from localhost -- see
+    # app/api/routes_control.py::require_control_access and
+    # docs/SEGURANCA.md.
     api_host: str = Field(default="127.0.0.1")
+    api_port: int = Field(default=8000)
     api_allow_external_bind: bool = Field(default=False)
+    control_api_token: str = Field(default="")
 
     @field_validator("bybit_base_url", "bybit_ws_url")
     @classmethod

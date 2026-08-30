@@ -23,8 +23,14 @@ de `app/risk/engine.py` referencia o token privado de aprovação ou constrói
 - **app/core** — configuração (`config.py`, com `RunMode` e allowlist de hosts
   Bybit demo/testnet), relógio UTC (`clock.py`), logging estruturado com
   redação de segredos (`logging.py`), exceções de domínio (`errors.py`).
-- **app/persistence** — modelos SQLAlchemy (`models.py`) e um repositório
-  fino de funções tipadas (`repo.py`) sobre uma `Session`.
+- **app/persistence** — modelos SQLAlchemy (`models.py`), um repositório
+  fino de funções tipadas (`repo.py`) sobre uma `Session`, e um sistema de
+  migrações versionadas próprio (`migrations.py`, ver `docs/MIGRACOES.md`)
+  que `db.py::init_db()` executa a cada start do processo — nunca um
+  `create_all()` cru, que não altera tabelas já existentes.
+- **app/run.py** — único ponto de entrada suportado para iniciar o
+  servidor (`python -m app.run`); repassa `Settings.api_host`/`api_port`
+  validados diretamente a `uvicorn.run()`.
 - **app/market_data** — `ReplayMarketDataProvider` (fixture local, zero rede)
   e `BybitDemoMarketDataProvider` (REST polling com backoff exponencial,
   válido apenas contra hosts demo/testnet).

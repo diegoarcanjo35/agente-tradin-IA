@@ -19,13 +19,20 @@ Nenhuma credencial é necessária para o modo padrão (`REPLAY`).
 
 ## Execução
 
+Use **sempre** o launcher oficial — é o único ponto de entrada que garante
+que `API_HOST`/`API_PORT` validados (ver `docs/SEGURANCA.md`) sejam
+realmente o host/porta usados pelo servidor:
+
 ```bash
-.venv/Scripts/python -m uvicorn app.api.main:app --host 127.0.0.1 --port 8034
+.venv/Scripts/python -m app.run
 ```
 
-Abra `http://127.0.0.1:8034`. O painel mostra o estado do sistema, posições,
-sinais, decisões do Risk Engine, recomendações da IA em shadow mode, curva de
-equity e histórico de erros.
+Abra `http://127.0.0.1:8000` (ou a porta definida em `API_PORT`). O painel
+mostra o estado do sistema, posições, sinais, decisões do Risk Engine,
+recomendações da IA em shadow mode, curva de equity e histórico de erros.
+
+Não inicie o servidor com `uvicorn app.api.main:app --host ...` diretamente
+— esse caminho contorna a validação de host feita pelo launcher.
 
 Para os demais modos (`PAPER_LOCAL`, `BYBIT_DEMO`), copie `.env.example`
 para `.env` e siga `docs/OPERACAO_DEMO.md`.
@@ -55,8 +62,8 @@ O modo padrão é `REPLAY` — basta rodar o comando de execução acima, sem
 
 ## Como ativar e testar o kill switch
 
-Ver seção correspondente em `docs/OPERACAO_DEMO.md`. Resumo: botão "Engage
-Kill Switch" no painel, ou `POST /api/kill-switch/engage`.
+Ver seção correspondente em `docs/OPERACAO_DEMO.md`. Resumo: botão "Ativar
+bloqueio de emergência" no painel, ou `POST /api/kill-switch/engage`.
 
 ## Limitações conhecidas
 
@@ -78,6 +85,7 @@ Kill Switch" no painel, ou `POST /api/kill-switch/engage`.
 - `docs/METRICAS.md`
 - `docs/OPERACAO_DEMO.md`
 - `docs/MODELO_DE_DADOS.md`
+- `docs/MIGRACOES.md`
 
 ---
 

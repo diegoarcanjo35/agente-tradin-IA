@@ -59,6 +59,17 @@ class BybitDemoMarketDataProvider:
     over" -- only the latter may end the orchestrator's polling loop. It
     also never hands back a candle that (a) is the same one already
     returned, or (b) is still forming (its period hasn't fully elapsed yet).
+
+    Correction v1.3 #2: Bybit's kline endpoint returns rows newest-first,
+    and the most recent one is very often still forming. Polling with
+    `limit=1` can therefore return only an open candle over and over,
+    leaving the last CLOSED candle permanently outside the response window
+    and never delivered to the strategy. `fetch_limit` (default 5) requests
+    enough history that at least one closed, not-yet-processed candle is
+    normally present; every call parses the whole batch, keeps only closed
+    and not-yet-processed rows, and returns the OLDEST of those -- so a run
+    of several pending closed candles (e.g. after a period of failures) is
+    drained one at a time, in chronological order, with no gaps.
     """
 
     def __init__(
@@ -69,6 +80,7 @@ class BybitDemoMarketDataProvider:
         http_get: Callable[[str, dict], dict],
         sleep: Callable[[float], None] = time.sleep,
         now_fn: Callable[[], datetime] = utcnow,
+        fetch_limit: int = 5,
     ):
         assert_demo_host(base_url)
         self.base_url = base_url
@@ -77,17 +89,38 @@ class BybitDemoMarketDataProvider:
         self._http_get = http_get
         self._sleep = sleep
         self._now_fn = now_fn
+        self._fetch_limit = fetch_limit
         self._interval_duration = parse_bybit_interval_to_timedelta(timeframe)
         self._backoff = BackoffPolicy()
         self._last_received_at: datetime | None = None
         self._last_processed_open_time: datetime | None = None
         self._consecutive_failures = 0
 
+    def _parse_row(self, row: list, received_at: datetime) -> tuple[datetime, CandleTick]:
+        # Bybit kline rows: [start, open, high, low, close, volume, turnover]
+        open_time = datetime.fromtimestamp(int(row[0]) / 1000, tz=timezone.utc)
+        candle = CandleTick(
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            open_time=open_time,
+            open=float(row[1]),
+            high=float(row[2]),
+            low=float(row[3]),
+            close=float(row[4]),
+            volume=float(row[5]),
+            source="bybit_demo",
+            received_at=received_at,
+        )
+        return open_time, candle
+
     def next_candle(self) -> CandleFetchResult:
         try:
             resp = self._http_get(
                 f"{self.base_url}/v5/market/kline",
-                {"category": "linear", "symbol": self.symbol, "interval": self.timeframe, "limit": 1},
+                {
+                    "category": "linear", "symbol": self.symbol,
+                    "interval": self.timeframe, "limit": self._fetch_limit,
+                },
             )
             self._backoff.reset()
             self._consecutive_failures = 0
@@ -106,32 +139,27 @@ class BybitDemoMarketDataProvider:
         if not rows:
             return CandleFetchResult(status=CandleFetchStatus.NO_NEW_CANDLE)
 
-        # Bybit kline rows: [start, open, high, low, close, volume, turnover]
-        row = rows[0]
-        open_time = datetime.fromtimestamp(int(row[0]) / 1000, tz=timezone.utc)
+        now = self._now_fn()
+        parsed = [self._parse_row(row, now) for row in rows]  # order not assumed (newest-first per Bybit)
 
-        if self._last_processed_open_time is not None and open_time <= self._last_processed_open_time:
+        pending_closed = [
+            (open_time, candle) for open_time, candle in parsed
+            if now >= open_time + self._interval_duration
+            and (self._last_processed_open_time is None or open_time > self._last_processed_open_time)
+        ]
+        if not pending_closed:
             return CandleFetchResult(status=CandleFetchStatus.NO_NEW_CANDLE)
 
-        close_time = open_time + self._interval_duration
-        if self._now_fn() < close_time:
-            # Still forming -- never make a decision on an open candle.
-            return CandleFetchResult(status=CandleFetchStatus.NO_NEW_CANDLE)
+        pending_closed.sort(key=lambda pair: pair[0])
+        open_time, candle = pending_closed[0]  # oldest pending closed candle first -- never skip ahead
 
-        now = utcnow()
-        self._last_received_at = now
+        received_at = utcnow()
+        self._last_received_at = received_at
         self._last_processed_open_time = open_time
         candle = CandleTick(
-            symbol=self.symbol,
-            timeframe=self.timeframe,
-            open_time=open_time,
-            open=float(row[1]),
-            high=float(row[2]),
-            low=float(row[3]),
-            close=float(row[4]),
-            volume=float(row[5]),
-            source="bybit_demo",
-            received_at=now,
+            symbol=candle.symbol, timeframe=candle.timeframe, open_time=candle.open_time,
+            open=candle.open, high=candle.high, low=candle.low, close=candle.close,
+            volume=candle.volume, source=candle.source, received_at=received_at,
         )
         return CandleFetchResult(status=CandleFetchStatus.CANDLE_AVAILABLE, candle=candle)
 

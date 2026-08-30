@@ -23,11 +23,21 @@ O modo padrão é `REPLAY` e não exige `.env` nem qualquer credencial:
 python -m venv .venv
 .venv/Scripts/pip install -r requirements.txt   # Windows
 # .venv/bin/pip install -r requirements.txt      # Linux/Mac
-.venv/Scripts/python -m uvicorn app.api.main:app --host 127.0.0.1 --port 8034
+.venv/Scripts/python -m app.run
 ```
 
-Abra `http://127.0.0.1:8034`. O sistema roda inteiramente sobre
+Abra `http://127.0.0.1:8000`. O sistema roda inteiramente sobre
 `fixtures/replay_btcusdt.json`, sem qualquer chamada de rede.
+
+**Sempre inicie pelo launcher oficial (`python -m app.run`)** — é o único
+código que efetivamente repassa `API_HOST`/`API_PORT` validados ao
+`uvicorn` (correção v1.3 #3). Um `uvicorn app.api.main:app --host 0.0.0.0`
+direto contorna essa validação por completo, já que a decisão do host de
+bind acontece na camada do próprio `uvicorn`/CLI, fora do alcance do código
+Python da aplicação. Como segunda camada de proteção, independente de como
+o processo foi iniciado, os endpoints de bloqueio de emergência exigem
+origem local ou `CONTROL_API_TOKEN` para *desativar* o bloqueio (ver
+`docs/SEGURANCA.md`).
 
 ## Modos disponíveis
 
@@ -76,6 +86,20 @@ constraint única (`symbol, timeframe, open_time`) como defesa adicional —
 `repo.save_candle()` nunca levanta exceção em caso de duplicata concorrente,
 apenas retorna `None` e a tick é ignorada sem criar sinal/IA/avaliação de
 risco duplicados.
+
+### Seleção do candle fechado anterior (correção v1.3 #2)
+
+A Bybit retorna as linhas de kline **da mais nova para a mais antiga**, e a
+mais nova é frequentemente um candle ainda em formação. Consultar com
+`limit=1` podia devolver só esse candle aberto repetidamente, deixando o
+candle fechado anterior permanentemente fora da janela de resposta — o
+processo nunca entregava candle algum à estratégia. `BybitDemoMarketDataProvider`
+agora consulta `fetch_limit` linhas (padrão 5), interpreta todas
+(independente da ordem), filtra apenas as fechadas (`open_time + intervalo
+<= agora`) e ainda não processadas, e entrega sempre a **mais antiga
+pendente** — nunca pulando à frente. Se várias tiverem se acumulado (ex.:
+após um período de falhas), são drenadas uma por chamada, em ordem
+cronológica, sem lacunas. Coberto por `tests/test_closed_candle_selection.py`.
 
 ## Testando o kill switch
 

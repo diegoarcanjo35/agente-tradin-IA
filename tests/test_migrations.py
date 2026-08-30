@@ -1,0 +1,382 @@
+"""Correction v1.3 #1: the versioned migration system must upgrade a
+database created by the ORIGINAL Fase 1 baseline schema (before correction
+v1.1) to the current schema, preserving every row, idempotently, and must
+stop safely (never fake success) if a migration fails partway.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import pytest
+from sqlalchemy import text
+
+from app.persistence.db import make_engine, make_session_factory, session_scope
+from app.persistence.migrations import (
+    CURRENT_SCHEMA_VERSION,
+    MigrationError,
+    current_schema_version,
+    run_migrations,
+)
+from app.persistence import repo
+
+# The exact DDL of the ORIGINAL Fase 1 baseline schema (commit 66f1a17,
+# before correction v1.1 added system_state.state_ambiguous/orders.is_close/
+# nullable orders.stop_loss, and before correction v1.2 added
+# system_state.clock_out_of_sync and the unique index on candles). Written
+# independently of the current app/persistence/models.py so this test
+# exercises migrating a genuinely old schema, not a derived one.
+_V0_SCHEMA_SQL = [
+    """CREATE TABLE candles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol VARCHAR(32) NOT NULL,
+        timeframe VARCHAR(8) NOT NULL,
+        open_time DATETIME NOT NULL,
+        open FLOAT NOT NULL, high FLOAT NOT NULL, low FLOAT NOT NULL, close FLOAT NOT NULL,
+        volume FLOAT NOT NULL, source VARCHAR(16) NOT NULL, received_at DATETIME NOT NULL
+    )""",
+    """CREATE TABLE strategy_signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol VARCHAR(32) NOT NULL, direction VARCHAR(8) NOT NULL, justification TEXT NOT NULL,
+        observed_price FLOAT NOT NULL, atr FLOAT NOT NULL, params_json TEXT NOT NULL,
+        created_at DATETIME NOT NULL
+    )""",
+    """CREATE TABLE ai_recommendations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol VARCHAR(32) NOT NULL, signal_id INTEGER, recommendation VARCHAR(8) NOT NULL,
+        confidence FLOAT NOT NULL, reasoning_summary VARCHAR(500) NOT NULL, risk_flags_json TEXT NOT NULL,
+        provider VARCHAR(64) NOT NULL, model_version VARCHAR(64) NOT NULL, is_valid BOOLEAN NOT NULL,
+        rejection_reason VARCHAR(255), created_at DATETIME NOT NULL
+    )""",
+    """CREATE TABLE risk_evaluations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_id INTEGER NOT NULL, approved BOOLEAN NOT NULL, reason TEXT NOT NULL,
+        checks_json TEXT NOT NULL, created_at DATETIME NOT NULL
+    )""",
+    # Orders at v0: stop_loss is NOT NULL, no is_close column.
+    """CREATE TABLE orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        idempotency_key VARCHAR(128) NOT NULL,
+        risk_evaluation_id INTEGER NOT NULL, symbol VARCHAR(32) NOT NULL, side VARCHAR(8) NOT NULL,
+        qty FLOAT NOT NULL, stop_loss FLOAT NOT NULL, take_profit FLOAT,
+        status VARCHAR(16) NOT NULL, exchange_order_id VARCHAR(128), mode VARCHAR(16) NOT NULL,
+        created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL
+    )""",
+    "CREATE UNIQUE INDEX ix_orders_idempotency_key ON orders (idempotency_key)",
+    "CREATE INDEX ix_orders_symbol ON orders (symbol)",
+    """CREATE TABLE executions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER NOT NULL, fill_qty FLOAT NOT NULL, fill_price FLOAT NOT NULL,
+        fee FLOAT NOT NULL, is_partial BOOLEAN NOT NULL, executed_at DATETIME NOT NULL
+    )""",
+    """CREATE TABLE positions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol VARCHAR(32) NOT NULL, side VARCHAR(8) NOT NULL, qty FLOAT NOT NULL,
+        avg_entry_price FLOAT NOT NULL, stop_loss FLOAT NOT NULL, take_profit FLOAT,
+        status VARCHAR(16) NOT NULL, realized_pnl FLOAT NOT NULL, fees_paid FLOAT NOT NULL,
+        opened_at DATETIME NOT NULL, closed_at DATETIME
+    )""",
+    """CREATE TABLE account_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        balance FLOAT NOT NULL, equity FLOAT NOT NULL, unrealized_pnl FLOAT NOT NULL,
+        mode VARCHAR(16) NOT NULL, taken_at DATETIME NOT NULL
+    )""",
+    """CREATE TABLE security_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_type VARCHAR(64) NOT NULL, detail TEXT NOT NULL, created_at DATETIME NOT NULL
+    )""",
+    """CREATE TABLE failures_reconciliations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind VARCHAR(32) NOT NULL, detail TEXT NOT NULL, resolved BOOLEAN NOT NULL,
+        created_at DATETIME NOT NULL
+    )""",
+    # system_state at v0: no state_ambiguous, no clock_out_of_sync.
+    """CREATE TABLE system_state (
+        id INTEGER PRIMARY KEY,
+        trading_blocked BOOLEAN NOT NULL, block_reason VARCHAR(255),
+        kill_switch_engaged BOOLEAN NOT NULL, consecutive_losses INTEGER NOT NULL,
+        cooldown_until DATETIME, api_failure_count INTEGER NOT NULL, updated_at DATETIME NOT NULL
+    )""",
+]
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _seed_v0_sample_data(engine) -> None:
+    """Inserts one realistic row into every table of the v0 schema."""
+    now = _now_iso()
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO candles (symbol, timeframe, open_time, open, high, low, close, volume, source, received_at) "
+            "VALUES ('BTCUSDT','1',:t,100,101,99,100.5,10,'bybit_demo',:t)"
+        ), {"t": now})
+        conn.execute(text(
+            "INSERT INTO strategy_signals (symbol, direction, justification, observed_price, atr, params_json, created_at) "
+            "VALUES ('BTCUSDT','BUY','cruzamento de alta',100.5,1.2,'{}',:t)"
+        ), {"t": now})
+        conn.execute(text(
+            "INSERT INTO ai_recommendations (symbol, signal_id, recommendation, confidence, reasoning_summary, "
+            "risk_flags_json, provider, model_version, is_valid, rejection_reason, created_at) "
+            "VALUES ('BTCUSDT',1,'BUY',0.6,'resumo','[]','simulated','simulated-v1',1,NULL,:t)"
+        ), {"t": now})
+        conn.execute(text(
+            "INSERT INTO risk_evaluations (signal_id, approved, reason, checks_json, created_at) "
+            "VALUES (1,1,'aprovado','{}',:t)"
+        ), {"t": now})
+        conn.execute(text(
+            "INSERT INTO orders (idempotency_key, risk_evaluation_id, symbol, side, qty, stop_loss, take_profit, "
+            "status, exchange_order_id, mode, created_at, updated_at) "
+            "VALUES ('key-1',1,'BTCUSDT','BUY',0.001,90.0,110.0,'FILLED','EX-1','PAPER_LOCAL',:t,:t)"
+        ), {"t": now})
+        conn.execute(text(
+            "INSERT INTO executions (order_id, fill_qty, fill_price, fee, is_partial, executed_at) "
+            "VALUES (1,0.001,100.5,0.01,0,:t)"
+        ), {"t": now})
+        conn.execute(text(
+            "INSERT INTO positions (symbol, side, qty, avg_entry_price, stop_loss, take_profit, status, "
+            "realized_pnl, fees_paid, opened_at, closed_at) "
+            "VALUES ('BTCUSDT','BUY',0.001,100.5,90.0,110.0,'OPEN',0,0.01,:t,NULL)"
+        ), {"t": now})
+        conn.execute(text(
+            "INSERT INTO account_snapshots (balance, equity, unrealized_pnl, mode, taken_at) "
+            "VALUES (1000,1000,0,'PAPER_LOCAL',:t)"
+        ), {"t": now})
+        conn.execute(text(
+            "INSERT INTO security_events (event_type, detail, created_at) VALUES ('KILL_SWITCH_ENGAGED','teste',:t)"
+        ), {"t": now})
+        conn.execute(text(
+            "INSERT INTO failures_reconciliations (kind, detail, resolved, created_at) "
+            "VALUES ('FAILURE','falha de teste',0,:t)"
+        ), {"t": now})
+        conn.execute(text(
+            "INSERT INTO system_state (id, trading_blocked, block_reason, kill_switch_engaged, "
+            "consecutive_losses, cooldown_until, api_failure_count, updated_at) "
+            "VALUES (1,0,NULL,0,0,NULL,0,:t)"
+        ), {"t": now})
+
+
+def _make_legacy_v0_engine(tmp_path, name="legacy_v0.db"):
+    db_path = tmp_path / name
+    engine = make_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        for statement in _V0_SCHEMA_SQL:
+            conn.execute(text(statement))
+    _seed_v0_sample_data(engine)
+    return engine
+
+
+def _row_counts(engine) -> dict[str, int]:
+    tables = [
+        "candles", "strategy_signals", "ai_recommendations", "risk_evaluations",
+        "orders", "executions", "positions", "account_snapshots",
+        "security_events", "failures_reconciliations", "system_state",
+    ]
+    with engine.connect() as conn:
+        return {t: conn.execute(text(f"SELECT COUNT(*) FROM {t}")).scalar() for t in tables}
+
+
+def test_legacy_v0_database_starts_at_version_0(tmp_path):
+    engine = _make_legacy_v0_engine(tmp_path)
+    assert current_schema_version(engine) == 0
+
+
+def test_upgrade_v0_to_current_preserves_all_data_and_adds_new_schema(tmp_path):
+    engine = _make_legacy_v0_engine(tmp_path)
+    before_counts = _row_counts(engine)
+    assert all(c == 1 for c in before_counts.values())
+
+    report = run_migrations(engine)
+
+    assert report.starting_version == 0
+    assert report.ending_version == CURRENT_SCHEMA_VERSION
+    assert report.applied == [1, 2]
+    assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
+
+    # 1. New columns exist.
+    with engine.connect() as conn:
+        cols_state = {r[1] for r in conn.execute(text("PRAGMA table_info(system_state)")).fetchall()}
+        assert "state_ambiguous" in cols_state
+        assert "clock_out_of_sync" in cols_state
+        cols_orders = {r[1] for r in conn.execute(text("PRAGMA table_info(orders)")).fetchall()}
+        assert "is_close" in cols_orders
+
+        # orders.stop_loss must now accept NULL (a close order has none).
+        conn.execute(text(
+            "INSERT INTO orders (idempotency_key, risk_evaluation_id, symbol, side, qty, stop_loss, "
+            "take_profit, is_close, status, exchange_order_id, mode, created_at, updated_at) "
+            "VALUES ('key-close',1,'BTCUSDT','SELL',0.001,NULL,NULL,1,'FILLED','EX-2','PAPER_LOCAL',:t,:t)"
+        ), {"t": _now_iso()})
+
+        # 2. Unique index on candles exists and is enforced.
+        idx = conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type='index' AND name='uq_candle_symbol_timeframe_open_time'")
+        ).fetchone()
+        assert idx is not None
+        with pytest.raises(Exception):
+            conn.execute(text(
+                "INSERT INTO candles (symbol, timeframe, open_time, open, high, low, close, volume, source, received_at) "
+                "SELECT symbol, timeframe, open_time, open, high, low, close, volume, source, received_at FROM candles LIMIT 1"
+            ))
+
+    # 3. Every pre-existing row from every table survived.
+    after_counts = _row_counts(engine)
+    for table, before in before_counts.items():
+        assert after_counts[table] == before, f"{table} lost rows during migration"
+
+    # 4. The rest of the app can actually use the migrated DB.
+    session_factory = make_session_factory(engine)
+    with session_scope(session_factory) as session:
+        state = repo.get_or_create_system_state(session)
+        assert state.state_ambiguous is False
+        assert state.clock_out_of_sync is False
+        positions = repo.open_positions(session)
+        assert len(positions) == 1
+
+
+def test_orchestrator_tick_runs_successfully_after_upgrade(tmp_path):
+    """Item 9 of the required upgrade proof: not just that the ORM can
+    query the migrated DB, but that a real Orchestrator.tick() runs
+    end-to-end against it right after the upgrade."""
+    from app.ai_shadow.agent import AIShadowAgent, SimulatedProvider
+    from app.core.clock import ReplayClockProvider
+    from app.core.config import RunMode, Settings
+    from app.execution.paper_local import PaperLocalExecutionEngine
+    from app.orchestrator import Orchestrator
+    from app.risk.engine import RiskEngine
+    from app.risk.config import RiskLimits
+    from app.strategy.engine import StrategyEngine
+    from tests.test_price_correctness import ListMarketDataProvider, make_candle
+
+    engine = _make_legacy_v0_engine(tmp_path, name="tick_after_upgrade.db")
+    run_migrations(engine)
+    session_factory = make_session_factory(engine)
+
+    settings = Settings(mode=RunMode.REPLAY)
+    price_state: dict[str, float] = {}
+    orch = Orchestrator(
+        settings=settings, session_factory=session_factory,
+        market_data_provider=ListMarketDataProvider([make_candle(0, 100.0)]),
+        strategy_engine=StrategyEngine(symbol="BTCUSDT"),
+        risk_engine=RiskEngine(RiskLimits()),
+        execution_engine=PaperLocalExecutionEngine(price_provider=lambda s: price_state.get(s, 0.0)),
+        ai_agent=AIShadowAgent(provider=SimulatedProvider(), enabled=True),
+        clock_provider=ReplayClockProvider(drift_seconds=0.0), price_state=price_state,
+    )
+
+    result = orch.tick()
+    assert result["status"] in ("hold", "rejected", "order_filled", "order_not_filled")
+
+
+def test_migration_is_idempotent(tmp_path):
+    engine = _make_legacy_v0_engine(tmp_path)
+    first = run_migrations(engine)
+    before_counts = _row_counts(engine)
+
+    second = run_migrations(engine)
+    after_counts = _row_counts(engine)
+
+    assert second.starting_version == CURRENT_SCHEMA_VERSION
+    assert second.applied == []
+    assert before_counts == after_counts
+
+    with engine.connect() as conn:
+        migration_rows = conn.execute(text("SELECT version FROM schema_migrations ORDER BY version")).fetchall()
+        versions = [r[0] for r in migration_rows]
+        assert versions == sorted(set(versions))  # no duplicate version rows
+
+
+def test_brand_new_database_is_stamped_not_altered(tmp_path):
+    db_path = tmp_path / "brand_new.db"
+    engine = make_engine(f"sqlite:///{db_path}")
+    report = run_migrations(engine)
+
+    assert report.stamped_only is True
+    assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
+
+    with engine.connect() as conn:
+        cols_state = {r[1] for r in conn.execute(text("PRAGMA table_info(system_state)")).fetchall()}
+        assert "state_ambiguous" in cols_state
+        assert "clock_out_of_sync" in cols_state
+
+
+def test_v1_database_only_needs_migration_2(tmp_path):
+    """A database created by the v1.1 app (state_ambiguous + is_close +
+    nullable stop_loss already present, but not clock_out_of_sync) must
+    only apply migration 2, never re-run the orders table rebuild."""
+    engine = _make_legacy_v0_engine(tmp_path, name="v0_then_v1.db")
+    # Fast-forward this DB to "v1 shape" by hand, bypassing the migrator,
+    # to simulate a database that was created directly by v1.1 app code.
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE system_state ADD COLUMN state_ambiguous BOOLEAN NOT NULL DEFAULT 0"))
+        conn.execute(text("ALTER TABLE orders ADD COLUMN is_close BOOLEAN NOT NULL DEFAULT 0"))
+
+    assert current_schema_version(engine) == 1
+
+    report = run_migrations(engine)
+    assert report.starting_version == 1
+    assert report.applied == [2]
+
+    with engine.connect() as conn:
+        cols = {r[1] for r in conn.execute(text("PRAGMA table_info(system_state)")).fetchall()}
+        assert "clock_out_of_sync" in cols
+
+
+def test_duplicate_candles_are_deterministically_deduplicated_before_unique_index(tmp_path):
+    engine = _make_legacy_v0_engine(tmp_path, name="dup_candles.db")
+    now = _now_iso()
+    with engine.begin() as conn:
+        # Two more rows sharing the exact same (symbol, timeframe, open_time)
+        # as the one already seeded by _seed_v0_sample_data -- but with a
+        # different close price, so we can tell which one survives.
+        row = conn.execute(text("SELECT open_time FROM candles LIMIT 1")).fetchone()
+        open_time = row[0]
+        conn.execute(text(
+            "INSERT INTO candles (symbol, timeframe, open_time, open, high, low, close, volume, source, received_at) "
+            "VALUES ('BTCUSDT','1',:ot,100,101,99,999.0,10,'bybit_demo',:t)"
+        ), {"ot": open_time, "t": now})
+        conn.execute(text(
+            "INSERT INTO candles (symbol, timeframe, open_time, open, high, low, close, volume, source, received_at) "
+            "VALUES ('BTCUSDT','1',:ot,100,101,99,888.0,10,'bybit_demo',:t)"
+        ), {"ot": open_time, "t": now})
+
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT COUNT(*) FROM candles")).scalar() == 3
+
+    run_migrations(engine)
+
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT id, close FROM candles ORDER BY id")).fetchall()
+        assert len(rows) == 1
+        # The canonical survivor is the lowest-id (earliest-inserted) row --
+        # the one seeded by _seed_v0_sample_data with close=100.5.
+        assert rows[0][1] == pytest.approx(100.5)
+
+
+def test_migration_failure_rolls_back_and_never_records_partial_success(tmp_path, monkeypatch):
+    import app.persistence.migrations as migrations_module
+
+    engine = _make_legacy_v0_engine(tmp_path, name="failing.db")
+
+    def _boom(conn):
+        raise RuntimeError("falha simulada de migração")
+
+    monkeypatch.setitem(
+        migrations_module.__dict__, "MIGRATIONS",
+        [(1, "migração 1 (falha proposital)", _boom)],
+    )
+
+    with pytest.raises(MigrationError) as excinfo:
+        run_migrations(engine)
+
+    assert "banco permanece na versão" in str(excinfo.value)
+
+    # Nothing was recorded as applied, and the original data is untouched.
+    with engine.connect() as conn:
+        applied = conn.execute(text("SELECT version FROM schema_migrations")).fetchall()
+        assert applied == []
+        cols = {r[1] for r in conn.execute(text("PRAGMA table_info(system_state)")).fetchall()}
+        assert "state_ambiguous" not in cols  # the failed migration's change was rolled back
+
+    after_counts = _row_counts(engine)
+    assert all(c == 1 for c in after_counts.values())

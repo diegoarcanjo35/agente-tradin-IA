@@ -94,10 +94,14 @@ def _generate_kline_rows(n_down: int, n_up: int) -> list[list[str]]:
 
 
 class _KlineSequenceTransport:
-    """Wraps FakeBybitTransport, serving one queued kline row per GET call
-    (mirroring Bybit's real limit=1 "latest candle" semantics) while
-    delegating order create/status/position calls to the real fake -- so
-    order submission is genuinely exercised, not mocked."""
+    """Correction v1.3 #2: serves REAL Bybit response shape/ordering -- each
+    call returns several rows, newest-first, with the newest row being a
+    still-forming "current" candle (rejected by the provider's closed-check)
+    followed by a window of already-closed historical candles in descending
+    order. This is what forced the fix: with limit=1 the still-forming row
+    alone used to be the only thing ever returned. Delegates order create/
+    status/position calls to the real fake -- so order submission is
+    genuinely exercised, not mocked."""
 
     def __init__(self, base: FakeBybitTransport, rows: list[list[str]]):
         self._base = base
@@ -110,9 +114,16 @@ class _KlineSequenceTransport:
         if url.endswith("/v5/market/kline"):
             if self._idx >= len(self._rows):
                 return {"result": {"list": []}}
-            row = self._rows[self._idx]
+            limit = int(params.get("limit", 1))
+            window_end = self._idx + 1
+            window_start = max(0, window_end - max(limit - 1, 1))
+            historical = self._rows[window_start:window_end]
             self._idx += 1
-            return {"result": {"list": [row]}}
+
+            forming_open = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+            forming_row = [str(int(forming_open.timestamp() * 1000)), "1", "1", "1", "1", "1", "0"]
+            newest_first = [forming_row] + list(reversed(historical))
+            return {"result": {"list": newest_first}}
         if url.endswith("/v5/market/time"):
             # Keeps BybitServerTimeProvider in sync so the clock-drift gate
             # doesn't itself block the order this test is trying to reach.

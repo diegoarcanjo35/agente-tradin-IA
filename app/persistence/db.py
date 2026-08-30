@@ -6,8 +6,6 @@ from typing import Iterator
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.persistence.models import Base
-
 
 def make_engine(database_url: str):
     connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
@@ -19,7 +17,13 @@ def make_session_factory(engine) -> sessionmaker:
 
 
 def init_db(engine) -> None:
-    Base.metadata.create_all(engine)
+    """Correction v1.3 #1: brings the schema up to date via the versioned
+    migration system instead of a bare `create_all()` -- see
+    app/persistence/migrations.py. Safe on a brand-new DB, a Fase 1 baseline
+    DB, a v1.1 DB, or an already-current DB."""
+    from app.persistence.migrations import run_migrations
+
+    run_migrations(engine)
 
 
 @contextmanager

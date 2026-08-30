@@ -114,14 +114,35 @@ usuário como frase. Verificado por `tests/test_frontend_i18n.py`.
   referência é `BybitServerTimeProvider`, que consulta `/v5/market/time` real
   da Bybit. Ver `tests/test_clock_sync.py`.
 
-## Bind da API de controle
+## Bind real do servidor e proteção da API de controle (correção v1.3 #3)
 
-- A API de controle (`/api/kill-switch/*`) **não possui autenticação** nesta
-  fase. `Settings.api_host` tem padrão `127.0.0.1`; iniciar com um host
-  diferente exige `API_ALLOW_EXTERNAL_BIND=true` explícito, ou o processo
-  recusa iniciar (`UnsafeBindHostError`). Ver
-  `tests/test_security.py::test_default_settings_bind_host_is_local`. Uma
-  implementação completa de autenticação fica para uma fase futura.
+Auditoria anterior apontou que validar `Settings.api_host` não bastava:
+nada impedia iniciar o processo com `uvicorn app.api.main:app --host
+0.0.0.0` diretamente, que ignora por completo a validação interna — a
+decisão do host de bind acontece na camada do `uvicorn`/CLI, fora do
+alcance do código Python da aplicação. Duas camadas independentes resolvem
+isso:
+
+1. **Launcher oficial** (`app/run.py`, `python -m app.run`): único ponto de
+   entrada suportado. Sempre lê `host`/`port` de `Settings` (já validados
+   por `Settings.assert_safe_bind_host()`) e os repassa a
+   `uvicorn.run(...)` programaticamente — nunca há um argumento de CLI
+   solto que possa divergir do valor validado. Testado alcançando o
+   ponto real de chamada a `uvicorn.run()`:
+   `tests/test_bind_protection.py::test_launcher_passes_validated_settings_host_and_port_to_uvicorn`.
+   Documentação e README instruem a nunca iniciar por outro caminho.
+2. **Autenticação da API de controle**, independente de como o servidor foi
+   iniciado: ativar o bloqueio de emergência nunca exige autenticação (só
+   aumenta a segurança); desativá-lo exige origem local
+   (`127.0.0.1`/`::1`) **ou** o cabeçalho `X-Control-Token` batendo com
+   `CONTROL_API_TOKEN` (comparação seguindo `hmac.compare_digest`). Sem
+   token configurado, qualquer origem não local é negada por padrão —
+   nunca liberado por omissão. Ver
+   `app/api/routes_control.py::require_local_or_authenticated` e
+   `tests/test_bind_protection.py`.
+
+Uma implementação completa de autenticação para todos os endpoints (não só
+o kill switch) fica para uma fase futura.
 
 ## Proteção contra injeção de HTML no painel (correção v1.2 #7)
 
