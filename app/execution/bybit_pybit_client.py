@@ -27,11 +27,18 @@ _PYBIT_ENV_KWARGS = {
 }
 
 
-def build_pybit_client(base_url: str, ws_url: str, api_key: str, api_secret: str) -> HTTP:
+def build_pybit_client(
+    base_url: str, ws_url: str, api_key: str, api_secret: str, timeout_seconds: float = 10.0,
+) -> HTTP:
     """Derives the pybit client mode from the VALIDATED host environment,
     instead of hardcoding demo=True regardless of what base_url actually
     says. Cross-checks base_url and ws_url resolve to the same environment
-    before constructing anything."""
+    before constructing anything.
+
+    Correção operacional do poll loop v1.0: `timeout_seconds` is always
+    passed explicitly to `HTTP()` -- pybit's own `_V5HTTPManager` already
+    defaults `timeout=10`, but this app never relies on that implicit
+    default; it is configured via `Settings.bybit_http_timeout_seconds`."""
     env = assert_consistent_bybit_environment(base_url, ws_url)
     kwargs = _PYBIT_ENV_KWARGS.get(env)
     if kwargs is None:
@@ -39,17 +46,20 @@ def build_pybit_client(base_url: str, ws_url: str, api_key: str, api_secret: str
             f"Ambiente Bybit '{env}' não possui configuração de cliente pybit suportada "
             "nesta fase. Inicialização recusada."
         )
-    return HTTP(api_key=api_key, api_secret=api_secret, **kwargs)
+    return HTTP(api_key=api_key, api_secret=api_secret, timeout=int(timeout_seconds), **kwargs)
 
 
-def build_public_pybit_client(base_url: str, ws_url: str) -> HTTP:
+def build_public_pybit_client(base_url: str, ws_url: str, timeout_seconds: float = 10.0) -> HTTP:
     """Fase 2, item 7.1 (PAPER_LIVE): the SAME host validation as
     `build_pybit_client`, but constructed with NO credentials at all --
     `pybit`'s HTTP() client works for public endpoints (kline, server time)
     without api_key/api_secret; it simply can't sign private requests
     (order create/cancel, position list), which PAPER_LIVE never calls
     anyway (see app/api/main.py -- the PAPER_LIVE branch only ever pairs
-    this with PaperLocalExecutionEngine, never BybitDemoExecutionEngine)."""
+    this with PaperLocalExecutionEngine, never BybitDemoExecutionEngine).
+
+    Correção operacional do poll loop v1.0: same explicit `timeout_seconds`
+    as `build_pybit_client`."""
     env = assert_consistent_bybit_environment(base_url, ws_url)
     kwargs = _PYBIT_ENV_KWARGS.get(env)
     if kwargs is None:
@@ -57,7 +67,7 @@ def build_public_pybit_client(base_url: str, ws_url: str) -> HTTP:
             f"Ambiente Bybit '{env}' não possui configuração de cliente pybit suportada "
             "nesta fase. Inicialização recusada."
         )
-    return HTTP(**kwargs)
+    return HTTP(timeout=int(timeout_seconds), **kwargs)
 
 
 class PybitTransport:

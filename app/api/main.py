@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.ai_shadow.agent import AIShadowAgent, SimulatedProvider
 from app.api import routes_control, routes_dashboard
+from app.api.poll_engine import PollHealth, supervise_poll_loop
 from app.core.clock import ReplayClockProvider
 from app.core.config import RunMode, get_settings
 from app.core.logging import get_logger, log_event, setup_logging
@@ -104,7 +105,10 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator:
         if bybit_transport is not None:
             transport = bybit_transport
         else:
-            pybit_client = build_public_pybit_client(settings.bybit_base_url, settings.bybit_ws_url)
+            pybit_client = build_public_pybit_client(
+                settings.bybit_base_url, settings.bybit_ws_url,
+                timeout_seconds=settings.bybit_http_timeout_seconds,
+            )
             transport = PybitTransport(pybit_client)
 
         market_data_provider = BybitDemoMarketDataProvider(
@@ -139,6 +143,7 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator:
             pybit_client = build_pybit_client(
                 settings.bybit_base_url, settings.bybit_ws_url,
                 settings.bybit_api_key, settings.bybit_api_secret,
+                timeout_seconds=settings.bybit_http_timeout_seconds,
             )
             transport = PybitTransport(pybit_client)
 
@@ -222,37 +227,6 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator:
     return orchestrator
 
 
-async def _poll_loop(app: FastAPI) -> None:
-    """Correction v1.2 #1: only CandleFetchStatus.REPLAY_FINISHED (surfaced
-    by Orchestrator.tick() as status "no_data") may end this loop. Every
-    other outcome -- no new candle yet, a retryable error, a fatal error --
-    keeps polling; retryable/fatal errors just feed TRADING_BLOCKED via the
-    orchestrator instead of silently killing the background task."""
-    orch = app.state.orchestrator
-    settings = app.state.settings
-    # Fase 2, item 7.1: PAPER_LIVE polls real Bybit market data, so it needs
-    # the real rate-limit-aware cadence too, even though execution is
-    # simulated -- only REPLAY/PAPER_LOCAL (fixture data, no network) use
-    # the fast interval.
-    interval = (
-        settings.bybit_poll_interval_seconds
-        if settings.mode in (RunMode.BYBIT_DEMO, RunMode.PAPER_LIVE)
-        else settings.replay_poll_interval_seconds
-    )
-    while True:
-        result = orch.tick()
-        status = result.get("status")
-        if status == "no_data":
-            app.state.replay_done = True
-            log_event(logger, 20, "replay_complete")
-            return
-        if status == "retryable_error":
-            log_event(logger, 30, "market_data_retryable_error", detail=result.get("detail"))
-        elif status == "fatal_error":
-            log_event(logger, 40, "market_data_fatal_error", detail=result.get("detail"))
-        await asyncio.sleep(interval)
-
-
 async def _graceful_shutdown(app: FastAPI) -> None:
     """Correção v1.1 #7: `end_session()` existed but was dead code -- the
     old shutdown only cancelled the poll task, leaving the operational
@@ -295,7 +269,13 @@ async def _graceful_shutdown(app: FastAPI) -> None:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    app.state.loop_task = asyncio.create_task(_poll_loop(app))
+    # Correção operacional do poll loop v1.0: the task started here is now
+    # the SUPERVISOR (app/api/poll_engine.py::supervise_poll_loop), not the
+    # raw tick loop directly -- it owns creating/restarting/cancelling the
+    # actual worker task internally. `app.state.loop_task` keeps its name
+    # for the shutdown code below, which only needs "the one task to
+    # cancel and await" and doesn't care which coroutine that is.
+    app.state.loop_task = asyncio.create_task(supervise_poll_loop(app), name="poll-supervisor")
     try:
         yield
     finally:
@@ -312,6 +292,13 @@ def create_app() -> FastAPI:
     app.state.orchestrator = build_orchestrator(settings)
     app.state.replay_done = False
     app.state.loop_task = None
+    # Correção operacional do poll loop v1.0: process-memory health state,
+    # shared between the supervisor/worker (which update it) and
+    # /api/state + the activation endpoint (which read it). See
+    # app/api/poll_engine.py::PollHealth's docstring for why this is never
+    # persisted to the database.
+    app.state.poll_health = PollHealth()
+    app.state.poll_worker_task = None
 
     app.include_router(routes_dashboard.router, prefix="/api")
     app.include_router(routes_control.router, prefix="/api")

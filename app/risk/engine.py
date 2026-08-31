@@ -81,6 +81,11 @@ class RiskContext:
     # (which always pass the real SystemState.operational_state) can ever
     # be anything else.
     operational_state: str = "ATIVO"
+    # Correção operacional do poll loop v1.0: entry-only gate (never
+    # applied to evaluate_close -- a degraded market engine must never
+    # block reducing/closing exposure). Defaults to False so every
+    # pre-existing RiskContext construction is unaffected.
+    engine_degraded: bool = False
 
 
 @dataclass(frozen=True)
@@ -166,6 +171,17 @@ class RiskEngine:
                 "operational_state_active",
                 f"Estado operacional atual é {context.operational_state!r}; novas aberturas de "
                 f"posição exigem ativação explícita do operador (estado ATIVO).",
+            )
+
+        # Correção operacional do poll loop v1.0: entry-only -- a degraded
+        # market engine (DEGRADADO/PARADO/heartbeat vencido) never blocks
+        # closing/reducing exposure, only new openings.
+        checks["engine_not_degraded"] = not context.engine_degraded
+        if context.engine_degraded:
+            return reject(
+                "engine_not_degraded",
+                "Motor de mercado degradado ou com heartbeat vencido; novas aberturas de "
+                "posição estão bloqueadas até o motor voltar a ficar saudável.",
             )
 
         checks["cooldown_expired"] = (

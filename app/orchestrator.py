@@ -90,6 +90,15 @@ class Orchestrator:
         # UNAVAILABLE rather than a fabricated/simulated value.
         self.funding_provider = funding_provider
         self._last_funding_poll_at: datetime | None = None
+        # Correção operacional do poll loop v1.0: set from OUTSIDE (by
+        # app/api/poll_engine.py's worker/supervisor) whenever the poll
+        # engine itself is DEGRADADO/PARADO or its heartbeat has expired --
+        # deliberately process-memory only (resets on restart, exactly like
+        # the rest of the poll engine's health state). Read here so
+        # RiskEngine.evaluate() can refuse new entries even in the
+        # (should-be-impossible-post-fix, but defense-in-depth) case a tick
+        # still runs while the engine is otherwise considered unhealthy.
+        self.engine_degraded = False
 
     def tick(self) -> dict:
         from app.persistence.db import session_scope
@@ -293,6 +302,7 @@ class Orchestrator:
             now=utcnow(),
             reconciliation_stale=state.reconciliation_stale,
             operational_state=state.operational_state,
+            engine_degraded=self.engine_degraded,
         )
 
     def _run_ai_shadow(self, session, state, op_session, signal, signal_id: int, price: float) -> None:

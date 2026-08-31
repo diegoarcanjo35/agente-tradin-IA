@@ -127,6 +127,30 @@ class Settings(BaseSettings):
     bybit_poll_interval_seconds: float = Field(default=5.0)
     replay_poll_interval_seconds: float = Field(default=0.02)
 
+    # Correção operacional do poll loop v1.0: cada tick() roda isolado do
+    # event loop principal (executor dedicado, thread única), com este
+    # timeout explícito -- nunca depende só do timeout implícito do pybit.
+    # Uma chamada de mercado lenta nunca trava o painel/API.
+    poll_tick_timeout_seconds: float = Field(default=30.0)
+    # Backoff limitado após falha inesperada no ciclo de mercado -- nunca
+    # volta ao intervalo normal instantaneamente após uma falha, nunca
+    # cresce sem limite numa sequência de falhas.
+    poll_backoff_initial_seconds: float = Field(default=5.0)
+    poll_backoff_max_seconds: float = Field(default=60.0)
+    # Quantos ciclos saudáveis consecutivos são exigidos para sair de
+    # DEGRADADO e voltar a SAUDAVEL -- nunca instantâneo após uma única
+    # recuperação isolada.
+    poll_healthy_ticks_to_recover: int = Field(default=3)
+    # Heartbeat: se o último ciclo bem-sucedido ficar mais velho que este
+    # limite, o motor é considerado com heartbeat vencido -- bloqueia
+    # novas entradas mesmo que o servidor HTTP continue respondendo
+    # normalmente (o defeito exato desta correção: um servidor saudável
+    # não prova um motor de mercado vivo).
+    poll_heartbeat_max_age_seconds: float = Field(default=60.0)
+    # Timeout HTTP explícito do cliente pybit -- nunca depender apenas do
+    # default implícito da biblioteca (mesmo que hoje já exista um).
+    bybit_http_timeout_seconds: float = Field(default=10.0)
+
     # Correction v1.5 #1: explicit first-boot policy for market data backlog
     # draining. When set, a provider with no persisted cursor yet anchors to
     # this timestamp instead of the default "most recent closed candle at

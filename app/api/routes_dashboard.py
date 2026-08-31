@@ -23,6 +23,15 @@ _ENVIRONMENT_BANNERS = {
 _DEFAULT_BANNER = "AMBIENTE DEMO — SEM DINHEIRO REAL"
 
 
+def _poll_health_dict(request: Request) -> dict:
+    poll_health = getattr(request.app.state, "poll_health", None)
+    if poll_health is None:
+        from app.api.poll_engine import PollHealth
+
+        poll_health = PollHealth()
+    return poll_health.as_dict()
+
+
 @router.get("/state")
 def get_state(request: Request):
     orch = request.app.state.orchestrator
@@ -53,6 +62,15 @@ def get_state(request: Request):
             ),
             "reconciliation_interval_seconds": orch.settings.reconciliation_interval_seconds,
             "reconciliation_max_delay_seconds": orch.settings.reconciliation_max_delay_seconds,
+            # Correção operacional do poll loop v1.0: heartbeat/saúde do
+            # motor de mercado -- nunca aparenta saudável só porque este
+            # próprio endpoint HTTP respondeu (esse era exatamente o
+            # defeito: servidor web vivo, motor de mercado morto).
+            # `getattr` com fallback: só `create_app()` (produção) monta
+            # `app.state.poll_health` de verdade; testes que constroem um
+            # FastAPI mínimo só com este router continuam funcionando.
+            **_poll_health_dict(request),
+            "poll_heartbeat_max_age_seconds": orch.settings.poll_heartbeat_max_age_seconds,
         }
 
 

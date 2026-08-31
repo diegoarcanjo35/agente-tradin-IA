@@ -20,6 +20,13 @@ const OPERATIONAL_STATE_LABELS = {
   BLOQUEADO: "BLOQUEADO",
   ENCERRANDO: "ENCERRANDO",
 };
+const POLL_STATUS_LABELS = {
+  INICIANDO: "INICIANDO",
+  SAUDAVEL: "SAUDÁVEL",
+  DEGRADADO: "DEGRADADO (falha recente, tentando recuperar)",
+  PARADO: "PARADO (heartbeat vencido ou tarefa morta)",
+  ENCERRANDO: "ENCERRANDO",
+};
 const ORDER_STATUS_LABELS = {
   PENDING_SUBMIT: "AGUARDANDO ENVIO", SUBMITTED: "ENVIADA", PARTIALLY_FILLED: "PARCIALMENTE PREENCHIDA",
   FILLED: "PREENCHIDA", CANCEL_PENDING: "CANCELAMENTO PENDENTE", CANCELLED: "CANCELADA",
@@ -117,6 +124,22 @@ async function refreshState() {
   kvRow(box, "Falhas de API", s.api_failure_count);
   kvRow(box, "Última reconciliação", s.last_reconciliation_at ? new Date(s.last_reconciliation_at).toLocaleString("pt-BR") : "indisponível");
   kvRow(box, "Intervalo de reconciliação (s)", s.reconciliation_interval_seconds);
+
+  // Correção operacional do poll loop v1.0: o servidor HTTP respondendo
+  // nunca prova que o motor de mercado está vivo -- por isso este bloco
+  // tem sua própria seção, nunca escondida atrás do resto do painel.
+  const pollBox = $("poll-health-box");
+  clearChildren(pollBox);
+  const pollStatusLabel = POLL_STATUS_LABELS[s.poll_loop_status] || s.poll_loop_status;
+  const pollUnhealthy = s.poll_loop_status === "DEGRADADO" || s.poll_loop_status === "PARADO";
+  kvRow(pollBox, "Status do motor", pollStatusLabel, pollUnhealthy ? "negative" : "");
+  kvRow(pollBox, "Último ciclo iniciado", s.poll_last_started_at ? new Date(s.poll_last_started_at).toLocaleString("pt-BR") : "ainda não iniciou");
+  kvRow(pollBox, "Último ciclo concluído", s.poll_last_completed_at ? new Date(s.poll_last_completed_at).toLocaleString("pt-BR") : "ainda não concluiu");
+  kvRow(pollBox, "Último sucesso", s.poll_last_success_at ? new Date(s.poll_last_success_at).toLocaleString("pt-BR") : "nenhum ainda");
+  kvRow(pollBox, "Falhas consecutivas", s.poll_consecutive_failures, s.poll_consecutive_failures > 0 ? "negative" : "");
+  kvRow(pollBox, "Último erro", s.poll_last_error || "nenhum");
+  kvRow(pollBox, "Reinícios automáticos da tarefa", s.poll_restart_count);
+  kvRow(pollBox, "Limite de heartbeat (s)", s.poll_heartbeat_max_age_seconds);
 }
 
 async function refreshSession() {

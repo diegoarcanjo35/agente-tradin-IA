@@ -194,6 +194,24 @@ def activate_operational_state(request: Request):
     with session_scope(orch.session_factory) as session:
         state = repo.get_or_create_system_state(session)
 
+        # Correção operacional do poll loop v1.0: recusa ativar novas
+        # entradas se o motor de mercado estiver DEGRADADO/PARADO ou com
+        # heartbeat vencido -- nunca confia só no fato de este próprio
+        # endpoint HTTP ter respondido (era exatamente esse o defeito
+        # original: servidor web saudável não prova motor de mercado vivo).
+        from app.api.poll_engine import engine_unhealthy
+
+        poll_health = getattr(request.app.state, "poll_health", None)
+        if poll_health is not None and engine_unhealthy(poll_health, orch.settings.poll_heartbeat_max_age_seconds):
+            return {
+                "operational_state": state.operational_state,
+                "mensagem": (
+                    f"Não é possível ativar novas entradas: o motor de mercado está "
+                    f"'{poll_health.status.value}' ou com heartbeat vencido. Consulte "
+                    "/api/state para detalhes antes de tentar novamente."
+                ),
+            }
+
         if state.trading_blocked:
             return {
                 "operational_state": state.operational_state,
