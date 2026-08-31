@@ -261,13 +261,38 @@ class Settings(BaseSettings):
     @field_validator(
         "poll_tick_timeout_seconds", "poll_backoff_initial_seconds", "poll_backoff_max_seconds",
         "poll_heartbeat_max_age_seconds", "bybit_http_timeout_seconds",
+        # Correção Operacional do Poll Loop v1.2, Bloqueio 2: reprodução
+        # auditada -- `Settings(bybit_poll_interval_seconds=-1)` e
+        # `Settings(replay_poll_interval_seconds=-1)` eram aceitos sem
+        # erro; um valor zero/negativo elimina a pausa entre ciclos do
+        # laço principal (`await asyncio.sleep(interval)` em
+        # `app/api/poll_engine.py::poll_worker`), o que pode bombardear
+        # CPU/API sem limite -- exatamente a reprodução da auditoria.
+        #
+        # `reconciliation_max_delay_seconds` e `partial_fill_timeout_seconds`
+        # também são incluídos: são LIMITES (thresholds), não pausas de
+        # laço, mas zero/negativo neles não tem semântica segura (um limite
+        # de atraso zero deixaria a reconciliação permanentemente "atrasada"
+        # mesmo logo após rodar).
+        #
+        # Deliberadamente NÃO incluídos aqui: `reconciliation_interval_seconds`,
+        # `open_order_poll_interval_seconds`, `funding_poll_interval_seconds`
+        # -- esses são debounces de UM CICLO JÁ PAUSADO por
+        # `bybit_poll_interval_seconds`/`replay_poll_interval_seconds` (o
+        # laço em si nunca gira mais rápido por causa deles), e `0.0` é um
+        # valor deliberado e amplamente usado nos testes ("sempre devido,
+        # roda toda vez") -- forçar positividade aqui quebraria esse
+        # padrão estabelecido sem nenhum ganho real de segurança, o que a
+        # própria correção pede para evitar ("sem ampliar a arquitetura").
+        "bybit_poll_interval_seconds", "replay_poll_interval_seconds",
+        "reconciliation_max_delay_seconds", "partial_fill_timeout_seconds",
     )
     @classmethod
     def _validate_poll_durations_are_positive(cls, v: float, info) -> float:
-        # Correção Operacional do Poll Loop v1.1 (validação complementar):
-        # fail-fast at construction -- a zero/negative timeout, interval or
+        # Fail-fast at construction -- a zero/negative timeout, interval or
         # backoff would silently misbehave (e.g. HTTP(timeout=0) meaning
-        # "no timeout" to pybit/requests) rather than refuse to start.
+        # "no timeout" to pybit/requests, or a poll loop with no pause at
+        # all) rather than refuse to start.
         if v <= 0:
             raise ValueError(f"{info.field_name.upper()} deve ser positivo; recebido {v!r}.")
         return v

@@ -324,4 +324,13 @@ def create_app() -> FastAPI:
     return app
 
 
-app = create_app()
+# Correção Operacional do Poll Loop v1.2, Bloqueio 1: NO module-level
+# `app = create_app()` -- importing this module (or `create_app`, or any
+# route/helper from it) must never itself open a database, run migrations,
+# create/resume an operational session, run a reconciliation, spawn the
+# poll supervisor task, or touch any external client. Only a DELIBERATE
+# call to `create_app()` does any of that. Production starts the server
+# via `app/run.py`, which passes uvicorn the factory itself
+# (`"app.api.main:create_app"`, `factory=True`) -- uvicorn imports this
+# module (a pure import, no side effects) and only THEN calls
+# `create_app()` once to build the actual application.

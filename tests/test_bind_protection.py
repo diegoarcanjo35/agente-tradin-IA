@@ -41,7 +41,12 @@ def test_launcher_passes_validated_settings_host_and_port_to_uvicorn(monkeypatch
 
     run_module.run()
 
-    assert captured["app_path"] == "app.api.main:app"
+    # Correção Operacional do Poll Loop v1.2, Bloqueio 1: o launcher passa o
+    # FACTORY (`create_app`), nunca um objeto `app` pré-construído no nível
+    # do módulo -- só a chamada deliberada da factory (feita pelo próprio
+    # uvicorn, por causa de `factory=True`) inicializa a aplicação de verdade.
+    assert captured["app_path"] == "app.api.main:create_app"
+    assert captured["factory"] is True
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 9001
 

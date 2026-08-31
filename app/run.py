@@ -29,10 +29,18 @@ def run() -> None:
         logger, 20, "launcher_starting",
         host=settings.api_host, port=settings.api_port, mode=settings.mode.value,
     )
+    # Correção Operacional do Poll Loop v1.2, Bloqueio 1: passes uvicorn the
+    # FACTORY (`create_app`), not a pre-built module-level `app` object --
+    # `app/api/main.py` no longer instantiates one at import time (importing
+    # it must never itself open a database/run a reconciliation/spawn the
+    # poll loop). `factory=True` tells uvicorn to import the module (a pure,
+    # side-effect-free import) and call `create_app()` itself, exactly once,
+    # to build the real application.
     uvicorn.run(
-        "app.api.main:app",
+        "app.api.main:create_app",
         host=settings.api_host,
         port=settings.api_port,
+        factory=True,
     )
 
 
