@@ -103,8 +103,12 @@ async def test_consecutive_failures_apply_backoff_and_count_correctly(session_fa
     with session_scope(session_factory) as session:
         events = [e for e in repo.recent_security_events(session, limit=50) if e.event_type == "POLL_LOOP_TICK_FAILED"]
         # Um evento por tentativa de tick -- nem mais, nem menos (sem
-        # tempestade nem perda).
-        assert len(events) == len(calls)
+        # tempestade nem perda). Tolera-se no máximo 1 chamada a menos:
+        # o cancelamento do teste pode chegar bem no instante em que a
+        # thread já executou `tick_fn()` (incrementando `calls`) mas a
+        # corrotina ainda não processou essa exceção específica -- nunca
+        # mais eventos do que chamadas, o que provaria uma duplicação.
+        assert len(calls) - 1 <= len(events) <= len(calls)
 
 
 # --- 3: término inesperado da task fora da barreira interna --------------

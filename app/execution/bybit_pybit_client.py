@@ -27,6 +27,15 @@ _PYBIT_ENV_KWARGS = {
 }
 
 
+def _pybit_timeout(timeout_seconds: float) -> int:
+    """Correção Operacional do Poll Loop v1.1 (validação complementar):
+    `pybit`'s `HTTP(timeout=...)` takes an int; a naive `int(0.5)` truncates
+    to `0`, which pybit/requests would treat as "no timeout" -- silently
+    undoing an explicitly-configured, genuinely positive timeout. Rounds
+    instead, and never returns less than 1 for a positive input."""
+    return max(1, round(timeout_seconds))
+
+
 def build_pybit_client(
     base_url: str, ws_url: str, api_key: str, api_secret: str, timeout_seconds: float = 10.0,
 ) -> HTTP:
@@ -46,7 +55,7 @@ def build_pybit_client(
             f"Ambiente Bybit '{env}' não possui configuração de cliente pybit suportada "
             "nesta fase. Inicialização recusada."
         )
-    return HTTP(api_key=api_key, api_secret=api_secret, timeout=int(timeout_seconds), **kwargs)
+    return HTTP(api_key=api_key, api_secret=api_secret, timeout=_pybit_timeout(timeout_seconds), **kwargs)
 
 
 def build_public_pybit_client(base_url: str, ws_url: str, timeout_seconds: float = 10.0) -> HTTP:
@@ -67,7 +76,7 @@ def build_public_pybit_client(base_url: str, ws_url: str, timeout_seconds: float
             f"Ambiente Bybit '{env}' não possui configuração de cliente pybit suportada "
             "nesta fase. Inicialização recusada."
         )
-    return HTTP(timeout=int(timeout_seconds), **kwargs)
+    return HTTP(timeout=_pybit_timeout(timeout_seconds), **kwargs)
 
 
 class PybitTransport:

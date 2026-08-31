@@ -99,6 +99,12 @@ class PollHealth:
     # running every few seconds (or a dashboard polling /api/state every
     # 2s) never re-logs the same ongoing incident.
     heartbeat_alert_active: bool = False
+    # Correção v1.1 #3: same one-alert-per-episode guard, for a SINGLE
+    # tick that keeps exceeding `poll_tick_timeout_seconds` while still
+    # genuinely running (never abandoned -- see `poll_worker`) -- without
+    # this, re-awaiting the same stuck future would log/record a fresh
+    # incident on every single re-check.
+    timeout_alert_active: bool = False
 
     def as_dict(self) -> dict:
         return {
@@ -140,8 +146,17 @@ def is_heartbeat_expired(health: PollHealth, max_age_seconds: float, now: dateti
 def engine_unhealthy(health: PollHealth, max_heartbeat_age_seconds: float) -> bool:
     """Single source of truth for "may new entries be authorized" -- used
     by both `POST /api/operational-state/activate` and
-    `RiskEngine.evaluate()` (via `Orchestrator.engine_degraded`)."""
-    if health.status in (PollEngineStatus.DEGRADADO, PollEngineStatus.PARADO):
+    `RiskEngine.evaluate()` (via `Orchestrator.engine_degraded`).
+
+    Correção v1.1 #2: `INICIANDO` and `ENCERRANDO` are NEVER eligible for
+    new entries either -- the audited gap was exactly that `poll_worker`
+    used to mark `SAUDAVEL` before completing even a single tick, leaving
+    a real window where an operator could activate entries with zero
+    proof the engine could actually reach/process the market. Only
+    `SAUDAVEL` (which now requires at least one genuinely successful tick
+    -- see `poll_worker`) is ever eligible, on top of a non-expired
+    heartbeat."""
+    if health.status != PollEngineStatus.SAUDAVEL:
         return True
     return is_heartbeat_expired(health, max_heartbeat_age_seconds)
 
@@ -179,26 +194,60 @@ def _record_recovery(orch) -> None:
         logger.exception("failed_to_record_poll_recovery")
 
 
-async def _run_tick_isolated(orch, executor: ThreadPoolExecutor, timeout_seconds: float):
-    """Correção item 5: runs the synchronous, blocking `orch.tick()` in a
-    dedicated, single-worker executor so a slow market call never blocks
-    the FastAPI event loop -- the panel/API keep responding. Bounded by
-    `asyncio.wait_for`. A Python thread cannot be forcibly killed, so on
-    timeout the underlying thread may keep running in the background; the
-    caller (`poll_worker`) never submits a second job to this SAME
-    single-worker executor while one is still outstanding, which is what
-    keeps this bounded to exactly one thread ever, never an unbounded
-    leak, even under repeated timeouts."""
-    loop = asyncio.get_running_loop()
-    future = loop.run_in_executor(executor, orch.tick)
-    return await asyncio.wait_for(future, timeout=timeout_seconds)
+def _maybe_recover(app, health: PollHealth, orch, consecutive_healthy: int, settings) -> None:
+    """Correção v1.1 #1/#2: a SINGLE unified recovery rule, replacing the
+    old `if health.status == DEGRADADO: ...` check that could never fire
+    once the supervisor's independent heartbeat watch had already moved
+    the status to `PARADO` (correção v1.1 #1's exact reproduction: a tick
+    fails, the heartbeat expires DURING the backoff, the supervisor sets
+    `PARADO` -- and the old code, checking only `== DEGRADADO`, then
+    stayed `PARADO` forever even after dozens of later successful ticks).
+
+    `INICIANDO` needs only ONE genuinely successful tick to become
+    `SAUDAVEL` (correção v1.1 #2 -- proof the engine can actually reach/
+    process the market at all) but is never treated as a "recovery" (it
+    was never broken, so no `POLL_LOOP_RECOVERED` event is recorded).
+    `DEGRADADO`/`PARADO` require `poll_healthy_ticks_to_recover`
+    consecutive successes, exactly as before, and DO record one recovery
+    event -- never more than one per episode, since this only fires on the
+    transition itself."""
+    if health.status == PollEngineStatus.SAUDAVEL:
+        return
+    was_broken = health.status in (PollEngineStatus.DEGRADADO, PollEngineStatus.PARADO)
+    required = 1 if health.status == PollEngineStatus.INICIANDO else settings.poll_healthy_ticks_to_recover
+    if consecutive_healthy < required:
+        return
+    health.status = PollEngineStatus.SAUDAVEL
+    orch.engine_degraded = False
+    # Correção v1.1 (validação complementar): never leave a stale error
+    # message behind once genuinely recovered -- /api/state and the panel
+    # must never show SAUDAVEL alongside a misleading old error.
+    health.poll_last_error = None
+    health.heartbeat_alert_active = False
+    health.timeout_alert_active = False
+    if was_broken:
+        _record_recovery(orch)
 
 
 async def poll_worker(app) -> None:
-    """Correção item 2: the tick loop, now with a per-iteration exception
-    barrier, isolated/timed-out execution, and bounded backoff + recovery
-    tracking. Never returns except when `CandleFetchStatus.REPLAY_FINISHED`
-    is reached (surfaced as `status == "no_data"`) or when cancelled."""
+    """Correção item 2 / v1.1 #3: the tick loop, now with a per-iteration
+    exception barrier, isolated/timed-out execution, and bounded backoff +
+    recovery tracking. Never returns except when
+    `CandleFetchStatus.REPLAY_FINISHED` is reached (surfaced as
+    `status == "no_data"`) or when cancelled.
+
+    Correção v1.1 #3: a Python thread cannot be forcibly killed, so a tick
+    that exceeds `poll_tick_timeout_seconds` is NEVER abandoned -- the
+    SAME underlying future (protected by `asyncio.shield`, so re-awaiting
+    it never re-submits a new job) is awaited again on every subsequent
+    loop iteration until it genuinely resolves, one way or another. This
+    guarantees, structurally: at most one `orch.tick()` in flight ever;
+    no growing queue of cancelled attempts; no new attempt submitted while
+    the previous one is still alive. `app.state.poll_in_flight_future`
+    exposes the live future so `app.api.main._graceful_shutdown` can wait
+    for it to genuinely finish BEFORE running the final reconciliation/
+    `end_session()` -- never let a late tick mutate the database after
+    those have already run."""
     from app.core.config import RunMode  # local import: avoids a cycle at module load time
 
     orch = app.state.orchestrator
@@ -212,33 +261,57 @@ async def poll_worker(app) -> None:
     )
     backoff = settings.poll_backoff_initial_seconds
     consecutive_healthy = 0
-    health.status = PollEngineStatus.SAUDAVEL
-    orch.engine_degraded = False
+    loop = asyncio.get_running_loop()
 
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="poll-tick")
+    pending_future: asyncio.Future | None = None
     try:
         while True:
-            health.poll_last_started_at = utcnow()
+            if pending_future is None:
+                health.poll_last_started_at = utcnow()
+                pending_future = loop.run_in_executor(executor, orch.tick)
+                app.state.poll_in_flight_future = pending_future
+
             try:
-                result = await _run_tick_isolated(orch, executor, settings.poll_tick_timeout_seconds)
+                result = await asyncio.wait_for(
+                    asyncio.shield(pending_future), timeout=settings.poll_tick_timeout_seconds,
+                )
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
+                # Correção v1.1 #3: the future is SHIELDED -- it was never
+                # cancelled and keeps running for real in its thread.
+                # `pending_future` is deliberately NOT reset here, so the
+                # next loop iteration re-awaits this exact same future
+                # instead of submitting a second one.
                 consecutive_healthy = 0
-                health.poll_last_completed_at = utcnow()
                 health.poll_consecutive_failures += 1
-                health.poll_last_error = f"TimeoutError: tick excedeu {settings.poll_tick_timeout_seconds}s"
                 health.status = PollEngineStatus.DEGRADADO
                 orch.engine_degraded = True
-                logger.error("poll_tick_timeout")
-                _record_incident(
-                    orch, "POLL_LOOP_TICK_FAILED",
-                    "Ciclo de mercado excedeu o tempo limite configurado.", health.poll_last_error,
+                health.poll_last_error = (
+                    f"TimeoutError: tick em execução há mais de {settings.poll_tick_timeout_seconds}s "
+                    "(ainda em andamento, não abandonado)"
                 )
+                if not health.timeout_alert_active:
+                    # Correção v1.1 (sem tempestade de logs): só o PRIMEIRO
+                    # timeout deste mesmo tick pendurado gera log/incidente
+                    # -- re-checagens seguintes do MESMO tick não duplicam.
+                    health.timeout_alert_active = True
+                    logger.error("poll_tick_timeout_still_running")
+                    _record_incident(
+                        orch, "POLL_LOOP_TICK_FAILED",
+                        "Ciclo de mercado excedeu o tempo limite configurado (ainda em execução, "
+                        "aguardando conclusão real antes de qualquer nova tentativa).",
+                        health.poll_last_error,
+                    )
                 await asyncio.sleep(min(backoff, settings.poll_backoff_max_seconds))
                 backoff = min(backoff * 2, settings.poll_backoff_max_seconds)
                 continue
             except Exception as exc:  # noqa: BLE001 - this barrier is the entire point of this module
+                # The future genuinely finished (not a timeout) with an
+                # unexpected exception -- free it up for a fresh attempt.
+                pending_future = None
+                app.state.poll_in_flight_future = None
                 consecutive_healthy = 0
                 health.poll_last_completed_at = utcnow()
                 health.poll_consecutive_failures += 1
@@ -246,6 +319,7 @@ async def poll_worker(app) -> None:
                 health.poll_last_error = sanitized
                 health.status = PollEngineStatus.DEGRADADO
                 orch.engine_degraded = True
+                health.timeout_alert_active = False
                 logger.exception("poll_tick_unexpected_error")
                 _record_incident(
                     orch, "POLL_LOOP_TICK_FAILED",
@@ -255,15 +329,16 @@ async def poll_worker(app) -> None:
                 backoff = min(backoff * 2, settings.poll_backoff_max_seconds)
                 continue
 
+            # The future genuinely finished successfully.
+            pending_future = None
+            app.state.poll_in_flight_future = None
+            health.timeout_alert_active = False
             health.poll_last_completed_at = utcnow()
             health.poll_last_success_at = utcnow()
             health.poll_consecutive_failures = 0
             backoff = settings.poll_backoff_initial_seconds
             consecutive_healthy += 1
-            if health.status == PollEngineStatus.DEGRADADO and consecutive_healthy >= settings.poll_healthy_ticks_to_recover:
-                health.status = PollEngineStatus.SAUDAVEL
-                orch.engine_degraded = False
-                _record_recovery(orch)
+            _maybe_recover(app, health, orch, consecutive_healthy, settings)
 
             status = result.get("status")
             if status == "no_data":
@@ -279,6 +354,43 @@ async def poll_worker(app) -> None:
             await asyncio.sleep(interval)
     finally:
         executor.shutdown(wait=False, cancel_futures=False)
+
+
+async def wait_for_in_flight_tick_before_shutdown(app) -> None:
+    """Correção v1.1 #3: called by `app/api/main.py::_graceful_shutdown`
+    BEFORE running the final reconciliation / `end_session()` -- an
+    absolute guarantee, not best-effort, that no tick can still mutate
+    the database after those run. If a tick is genuinely still in flight
+    (the future is not done), this waits for it for real, with NO
+    artificial timeout that would let shutdown proceed regardless: it
+    only logs a single warning (explicit, testable) if the wait exceeds
+    `poll_tick_timeout_seconds`, and then keeps waiting for the actual
+    conclusion -- never abandons it, never lets shutdown race ahead of a
+    live database write."""
+    orch = app.state.orchestrator
+    settings = app.state.settings
+    in_flight = getattr(app.state, "poll_in_flight_future", None)
+    if in_flight is None or in_flight.done():
+        return
+
+    logger.warning("poll_loop_shutdown_waiting_for_in_flight_tick")
+    try:
+        await asyncio.wait_for(asyncio.shield(in_flight), timeout=settings.poll_tick_timeout_seconds)
+        return
+    except asyncio.TimeoutError:
+        pass
+    except Exception:  # noqa: BLE001 - the tick's own outcome is irrelevant here, only its completion matters
+        return
+
+    detail = (
+        f"Tick em voo não terminou em {settings.poll_tick_timeout_seconds}s durante o encerramento -- "
+        "aguardando a conclusão real antes de prosseguir com a reconciliação final/encerramento de sessão."
+    )
+    _record_incident(orch, "POLL_LOOP_SHUTDOWN_TICK_PENDING", detail, None)
+    try:
+        await asyncio.shield(in_flight)  # sem limite -- garantia absoluta, nunca abandona
+    except Exception:  # noqa: BLE001 - only completion matters here, not the tick's own outcome
+        pass
 
 
 async def supervise_poll_loop(app) -> None:

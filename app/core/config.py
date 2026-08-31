@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.errors import ProductionEndpointBlockedError, TradingSystemError
@@ -257,6 +257,40 @@ class Settings(BaseSettings):
                 f"PARTIAL_FILL_POLICY inválida: {v!r}. Valores aceitos: {sorted(allowed)}."
             )
         return v
+
+    @field_validator(
+        "poll_tick_timeout_seconds", "poll_backoff_initial_seconds", "poll_backoff_max_seconds",
+        "poll_heartbeat_max_age_seconds", "bybit_http_timeout_seconds",
+    )
+    @classmethod
+    def _validate_poll_durations_are_positive(cls, v: float, info) -> float:
+        # Correção Operacional do Poll Loop v1.1 (validação complementar):
+        # fail-fast at construction -- a zero/negative timeout, interval or
+        # backoff would silently misbehave (e.g. HTTP(timeout=0) meaning
+        # "no timeout" to pybit/requests) rather than refuse to start.
+        if v <= 0:
+            raise ValueError(f"{info.field_name.upper()} deve ser positivo; recebido {v!r}.")
+        return v
+
+    @field_validator("poll_healthy_ticks_to_recover")
+    @classmethod
+    def _validate_poll_healthy_ticks_to_recover(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"POLL_HEALTHY_TICKS_TO_RECOVER deve ser pelo menos 1; recebido {v!r}.")
+        return v
+
+    @model_validator(mode="after")
+    def _validate_poll_backoff_ordering(self) -> "Settings":
+        # Correção Operacional do Poll Loop v1.1 (validação complementar):
+        # um backoff máximo menor que o inicial faria o backoff efetivo
+        # DIMINUIR a cada falha em vez de crescer -- o oposto do que
+        # "backoff limitado" deveria significar.
+        if self.poll_backoff_max_seconds < self.poll_backoff_initial_seconds:
+            raise ValueError(
+                "POLL_BACKOFF_MAX_SECONDS não pode ser menor que POLL_BACKOFF_INITIAL_SECONDS "
+                f"({self.poll_backoff_max_seconds!r} < {self.poll_backoff_initial_seconds!r})."
+            )
+        return self
 
     @field_validator("bybit_base_url", "bybit_ws_url")
     @classmethod

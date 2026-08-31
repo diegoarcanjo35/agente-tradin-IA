@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.ai_shadow.agent import AIShadowAgent, SimulatedProvider
 from app.api import routes_control, routes_dashboard
-from app.api.poll_engine import PollHealth, supervise_poll_loop
+from app.api.poll_engine import PollHealth, supervise_poll_loop, wait_for_in_flight_tick_before_shutdown
 from app.core.clock import ReplayClockProvider
 from app.core.config import RunMode, get_settings
 from app.core.logging import get_logger, log_event, setup_logging
@@ -250,6 +250,17 @@ async def _graceful_shutdown(app: FastAPI) -> None:
         except Exception as exc:  # noqa: BLE001 - shutdown must never hang/crash on this
             log_event(logger, 40, "poll_loop_shutdown_error", detail=str(exc))
 
+    # Correção Operacional do Poll Loop v1.1, item 3: cancelling the
+    # supervisor/worker Tasks above does NOT kill an in-flight `orch.tick()`
+    # running inside its dedicated executor thread -- a Python thread can't
+    # be forcibly cancelled. Without this, that tick could still commit a
+    # write to the database AFTER the reconciliation/end_session below
+    # already ran. This is an absolute wait (never abandons it), so a
+    # genuinely stuck tick blocks shutdown rather than risking a late
+    # mutation -- see `wait_for_in_flight_tick_before_shutdown`'s
+    # docstring for the explicit, testable warning behavior.
+    await wait_for_in_flight_tick_before_shutdown(app)
+
     with session_scope(orch.session_factory) as session:
         state = repo.get_or_create_system_state(session)
         state.operational_state = "ENCERRANDO"
@@ -299,6 +310,7 @@ def create_app() -> FastAPI:
     # persisted to the database.
     app.state.poll_health = PollHealth()
     app.state.poll_worker_task = None
+    app.state.poll_in_flight_future = None
 
     app.include_router(routes_dashboard.router, prefix="/api")
     app.include_router(routes_control.router, prefix="/api")
