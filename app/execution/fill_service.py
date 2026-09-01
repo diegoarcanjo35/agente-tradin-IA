@@ -8,14 +8,143 @@ never touched `Execution`/`Position`/session counters at all).
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from datetime import timedelta
+
+from sqlalchemy import select
 
 from app.execution import fill_ledger
 from app.execution.base import OrderStatusSnapshot
 from app.execution.order_state import IllegalOrderTransitionError, OrderStatus, is_terminal
 from app.persistence import repo
-from app.persistence.models import Order, OperationalSession, SystemState
+from app.persistence.models import Execution, Order, OperationalSession, StrategySignal, SystemState
 from app.sessions import increment as increment_session_counter
+
+# Correção Cirúrgica do Stop/Take Pós-Preenchimento: devem bater com
+# StrategyConfig.stop_loss_atr_multiple / take_profit_atr_multiple
+# (app/strategy/engine.py) -- a mesma razão 1,5:1 usada no sinal, aplicada
+# de novo aqui, agora sobre o preço real de preenchimento em vez do preço
+# do sinal. Duplicados aqui (em vez de importar StrategyConfig) para manter
+# a camada de execução/preenchimento sem depender do módulo de estratégia.
+_STOP_LOSS_ATR_MULTIPLE = 2.0
+_TAKE_PROFIT_ATR_MULTIPLE = 3.0
+
+
+def _stop_target_from_fill(session, order: Order, fill_price: float) -> tuple[float | None, float | None]:
+    """Correção Cirúrgica do Stop/Take Pós-Preenchimento (achado da auditoria
+    de 31/08-01/09/2026): antes desta correção, o stop-loss e o take-profit
+    persistidos na posição vinham direto de `order.stop_loss`/
+    `order.take_profit` -- calculados pelo motor de estratégia sobre o preço
+    do SINAL, antes de qualquer slippage. Como o slippage simulado
+    (`app/execution/paper_local.py::submit`) é sempre adverso, isso deixava
+    os níveis persistidos sistematicamente deslocados em relação ao preço
+    real de entrada, degradando a razão risco:retorno nominal de 1,5:1 para
+    algo bem pior em todo trade.
+
+    Esta função recalcula os níveis DEFINITIVOS a partir de `fill_price` (o
+    preço real -- para o primeiro fill que abre uma posição, exatamente o
+    preço médio de preenchimento dessa posição), preservando o ATR
+    exatamente como calculado no sinal que originou a ordem (nunca
+    recalculado a partir de candles posteriores) -- lido diretamente de
+    `StrategySignal.atr` via `Order.risk_evaluation.signal_id`, nunca
+    re-derivado por aritmética reversa.
+
+    Nunca produz NaN/infinito/negativo: qualquer ATR ausente, não-finito ou
+    <= 0 (nunca deveria acontecer -- uma ordem só existe se o sinal já
+    passou pelo filtro de volatilidade ATR, que exige ATR > 0 -- mas
+    verificado aqui defensivamente) faz esta função devolver os níveis
+    originais da ordem sem alteração, em vez de arriscar um valor inválido.
+    """
+    if order.stop_loss is None or order.take_profit is None:
+        return order.stop_loss, order.take_profit
+
+    risk_evaluation = order.risk_evaluation
+    atr = None
+    if risk_evaluation is not None:
+        atr = session.execute(
+            select(StrategySignal.atr).where(StrategySignal.id == risk_evaluation.signal_id)
+        ).scalar_one_or_none()
+
+    if atr is None or not math.isfinite(atr) or atr <= 0:
+        return order.stop_loss, order.take_profit
+
+    if order.side == "BUY":
+        stop_loss = fill_price - _STOP_LOSS_ATR_MULTIPLE * atr
+        take_profit = fill_price + _TAKE_PROFIT_ATR_MULTIPLE * atr
+    else:
+        stop_loss = fill_price + _STOP_LOSS_ATR_MULTIPLE * atr
+        take_profit = fill_price - _TAKE_PROFIT_ATR_MULTIPLE * atr
+
+    if not (math.isfinite(stop_loss) and math.isfinite(take_profit)):
+        return order.stop_loss, order.take_profit
+
+    return stop_loss, take_profit
+
+
+_POSITION_OPENED_AT_RACE_TOLERANCE = timedelta(seconds=5)
+
+
+def _position_has_fills_from_a_different_order(session, position, order: Order) -> bool:
+    """Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 1: garante que a
+    posição aberta não está sendo alimentada por ATRs de sinais diferentes
+    silenciosamente. Um segundo fill da MESMA ordem (múltiplos fills/
+    snapshots) sempre passa por aqui livre -- só uma ordem DIFERENTE
+    contribuindo para o mesmo lado da mesma posição já aberta é bloqueada:
+    nunca escolhe um ATR arbitrário entre os dois sinais, nunca pirâmida
+    silenciosamente."""
+    other_order_id = session.execute(
+        select(Execution.order_id)
+        .join(Order, Execution.order_id == Order.id)
+        .where(
+            Order.symbol == position.symbol, Order.side == position.side,
+            Order.is_close.is_(False), Execution.order_id != order.id,
+            # A tolerância cobre a ordem de gravação DENTRO desta função: o
+            # fill da ordem que abriu a posição é registrado (fill_ledger)
+            # ANTES de `position.opened_at` ser gravado (repo.open_position
+            # roda depois, na mesma chamada) -- sem a folga, o próprio fill
+            # de abertura ficaria fora da janela e nunca seria encontrado
+            # como "já pertence a esta posição".
+            Execution.executed_at >= position.opened_at - _POSITION_OPENED_AT_RACE_TOLERANCE,
+        )
+        .limit(1)
+    ).scalar_one_or_none()
+    return other_order_id is not None
+
+
+def _sync_remote_protection(session, state: SystemState, execution_engine, order: Order, position) -> None:
+    """Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2: ponto único de
+    sincronização da proteção remota (stop/alvo) -- chamado depois de
+    QUALQUER recálculo de níveis (abertura ou fill adicional aplicado),
+    pelos mesmos 4 caminhos que descobrem fills e chamam
+    `apply_order_snapshot` (submit+poll imediato, poller periódico, corrida
+    do kill switch, reconciliação), sempre pela mesma função -- nunca
+    espalhada. PAPER_LOCAL/PAPER_LIVE nunca chamam nada remoto
+    (`ExecutionEngine.sync_position_protection` é um no-op que sempre
+    retorna True nesses modos -- ver app/execution/paper_local.py).
+    BYBIT_DEMO é o único modo que realmente chama a corretora (`POST
+    /v5/position/trading-stop`).
+
+    Uma falha nunca é silenciosa: `position.remote_protection_status` fica
+    'PENDING', `SystemState.protection_sync_pending` (persistido, nunca só
+    em memória) passa a bloquear novas entradas (RiskContext.
+    protection_sync_pending, entry-only -- nunca bloqueia fechamento), e um
+    evento de segurança é registrado. O retry é feito pela reconciliação
+    periódica (Orchestrator.reconcile()), que já roda no boot e
+    periodicamente -- nunca depende de estado em memória para retomar após
+    um reinício."""
+    synced = execution_engine.sync_position_protection(
+        order.symbol, position.side, position.stop_loss, position.take_profit,
+    )
+    position.remote_protection_status = "SYNCED" if synced else "PENDING"
+    session.flush()  # a sessão é autoflush=False -- sem isto, o recompute abaixo lê o valor antigo
+    if not synced:
+        detail = (
+            f"Sincronização da proteção remota (stop/alvo) falhou para a posição {position.id} "
+            f"({order.symbol} {position.side}); novas aberturas de posição bloqueadas até confirmação."
+        )
+        repo.record_security_event(session, "POSITION_PROTECTION_SYNC_FAILED", detail)
+    repo.recompute_protection_sync_pending(session, state)
 
 
 @dataclass(frozen=True)
@@ -28,7 +157,7 @@ class FillApplicationResult:
 
 def apply_order_snapshot(
     session, state: SystemState, op_session: OperationalSession | None, order: Order,
-    snapshot: OrderStatusSnapshot, is_close: bool, max_api_failures: int,
+    snapshot: OrderStatusSnapshot, is_close: bool, max_api_failures: int, execution_engine=None,
 ) -> FillApplicationResult:
     """Reconciles `order`'s persisted status/fills with `snapshot` (from
     `ExecutionEngine.poll_order()`):
@@ -104,10 +233,17 @@ def apply_order_snapshot(
         for row in new_rows:
             if not is_close:
                 if position is None:
+                    # Correção Cirúrgica do Stop/Take Pós-Preenchimento:
+                    # níveis derivados de `row.fill_price` (preço real desta
+                    # abertura), não de `order.stop_loss`/`order.take_profit`
+                    # (preço do sinal, pré-slippage).
+                    stop_loss, take_profit = _stop_target_from_fill(session, order, row.fill_price)
                     position = repo.open_position(
                         session, order.symbol, order.side, row.fill_qty, row.fill_price,
-                        order.stop_loss, order.take_profit, opening_fee=row.fee,
+                        stop_loss, take_profit, opening_fee=row.fee,
                     )
+                    if execution_engine is not None:
+                        _sync_remote_protection(session, state, execution_engine, order, position)
                 elif position.side != order.side:
                     # Correção v1.2 #5: a late/opposite fill -- e.g. the
                     # position already flipped/closed by the time this fill
@@ -120,8 +256,32 @@ def apply_order_snapshot(
                         "à posição (bloqueio de segurança); requer reconciliação manual."
                     )
                     repo.record_security_event(session, "LATE_OPPOSITE_FILL_BLOCKED", detail)
+                elif _position_has_fills_from_a_different_order(session, position, order):
+                    # Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 1:
+                    # esta posição já foi alimentada por uma ordem DIFERENTE
+                    # -- nunca mistura ATRs de sinais distintos silenciosamente
+                    # nem pirâmida; bloqueia e exige reconciliação manual.
+                    state.state_ambiguous = True
+                    detail = (
+                        f"Fill de entrada ({order.side}) da ordem {order.id} recebido para a posição "
+                        f"{position.id} ({order.symbol}), que já tem fills de uma ordem diferente -- fill "
+                        "NÃO aplicado (bloqueio de segurança contra piramidagem/ATR misto); requer "
+                        "reconciliação manual."
+                    )
+                    repo.record_security_event(session, "MULTI_ORDER_SAME_SIDE_FILL_BLOCKED", detail)
                 else:
                     repo.add_to_position(session, position, row.fill_qty, row.fill_price, row.fee)
+                    # Bloqueio 1: cada novo fill de entrada aplicado
+                    # recalcula os níveis sobre o avg_entry_price já
+                    # ponderado por TODOS os fills, dentro da mesma
+                    # transação -- nunca fica ancorado no fill isolado
+                    # anterior.
+                    stop_loss, take_profit = _stop_target_from_fill(session, order, position.avg_entry_price)
+                    position.stop_loss = stop_loss
+                    position.take_profit = take_profit
+                    session.flush()
+                    if execution_engine is not None:
+                        _sync_remote_protection(session, state, execution_engine, order, position)
             else:
                 if position is None:
                     # Nothing local to reduce/close -- reconciliation is what

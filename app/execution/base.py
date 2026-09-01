@@ -103,3 +103,18 @@ class ExecutionEngine(Protocol):
 
     def get_position(self, symbol: str) -> dict | None:
         ...
+
+    def sync_position_protection(
+        self, symbol: str, side: str, stop_loss: float | None, take_profit: float | None
+    ) -> bool:
+        """Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2: sincroniza
+        a proteção (stop-loss/take-profit) da posição INTEIRA no lado
+        remoto para os níveis fornecidos -- chamada pelo ponto único
+        `app/execution/fill_service.py::_sync_remote_protection` depois de
+        qualquer recálculo de níveis. PAPER_LOCAL/PAPER_LIVE nunca chamam
+        endpoint algum (sempre retornam True -- nada remoto a sincronizar).
+        BYBIT_DEMO é o único modo que realmente chama a corretora. Nunca
+        levanta para uma falha de transporte esperada (timeout/rate limit)
+        -- sempre retorna False nesse caso; o chamador decide a política de
+        bloqueio/retry."""
+        ...

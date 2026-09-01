@@ -28,7 +28,13 @@ from app.risk.config import RiskLimits
 from app.sessions import end_session, start_or_resume_session
 from app.strategy.engine import StrategyEngine
 
-STRATEGY_VERSION = "v1"
+# Correção Cirúrgica do Stop/Take Pós-Preenchimento: v1 -> v1.1 muda o
+# config_fingerprint (app/sessions.py::_config_fingerprint inclui
+# strategy_version) -- no próximo boot, start_or_resume_session encerra
+# graciosamente a sessão anterior (regra antiga: stop/take do preço do
+# sinal) e cria uma nova (regra nova: stop/take do preço de preenchimento),
+# permitindo comparar os dois períodos sem misturar resultados.
+STRATEGY_VERSION = "v1.1"
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 FIXTURES_DIR = BASE_DIR / "fixtures"

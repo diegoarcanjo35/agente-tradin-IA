@@ -298,6 +298,7 @@ class Orchestrator:
             reconciliation_stale=state.reconciliation_stale,
             operational_state=state.operational_state,
             engine_degraded=self.engine_degraded,
+            protection_sync_pending=state.protection_sync_pending,
         )
 
     def _run_ai_shadow(self, session, state, op_session, signal, signal_id: int, price: float) -> None:
@@ -446,6 +447,7 @@ class Orchestrator:
         result = fill_service.apply_order_snapshot(
             session, state, self._active_session(session, state), order_row, snapshot,
             is_close=order_row.is_close, max_api_failures=self.settings.risk_max_api_failures,
+            execution_engine=self.execution_engine,
         )
         return ack, result
 
@@ -593,6 +595,7 @@ class Orchestrator:
             fill_service.apply_order_snapshot(
                 session, state, op_session, order, snapshot,
                 is_close=order.is_close, max_api_failures=self.settings.risk_max_api_failures,
+                execution_engine=self.execution_engine,
             )
             self._maybe_apply_partial_fill_policy(session, state, op_session, order, now)
 
@@ -691,6 +694,7 @@ class Orchestrator:
         fill_service.apply_order_snapshot(
             session, state, op_session, order, cancel_snapshot,
             is_close=order.is_close, max_api_failures=self.settings.risk_max_api_failures,
+            execution_engine=self.execution_engine,
         )
 
     def reconcile(self, session, state) -> None:
@@ -724,6 +728,7 @@ class Orchestrator:
 
         position_ok = self._reconcile_positions_step(session, state, op_session)
         order_ok = self._reconcile_orders_step(session, state, op_session)
+        self._retry_pending_protection_sync(session, state)
 
         # Fase 2, item 7.7/7.8: a reconciliation that actually completed at
         # least its position half (reached the exchange and compared,
@@ -735,11 +740,44 @@ class Orchestrator:
         state.state_ambiguous = state.reconciliation_diverged
         repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
 
+    def _retry_pending_protection_sync(self, session, state) -> None:
+        """Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2: o retry
+        idempotente para uma sincronização de proteção remota que falhou --
+        chamado no boot (reconciliação inicial) e periodicamente (esta
+        função roda a cada `reconcile()`), nunca dependendo de estado em
+        memória para retomar após um reinício: consulta o banco (posições
+        com `remote_protection_status != 'SYNCED'`) e tenta de novo, com os
+        MESMOS níveis já persistidos na posição (nunca recalcula um valor
+        diferente aqui -- só o fill que os definiu pode mudá-los)."""
+        pending = [
+            p for p in repo.open_positions(session) if p.remote_protection_status != "SYNCED"
+        ]
+        for position in pending:
+            synced = self.execution_engine.sync_position_protection(
+                position.symbol, position.side, position.stop_loss, position.take_profit,
+            )
+            position.remote_protection_status = "SYNCED" if synced else "PENDING"
+            if synced:
+                repo.record_security_event(
+                    session, "POSITION_PROTECTION_SYNC_RECOVERED",
+                    f"Sincronização da proteção remota confirmada para a posição {position.id} "
+                    f"({position.symbol} {position.side}) após nova tentativa.",
+                )
+        if pending:
+            session.flush()  # sessão autoflush=False -- sem isto, o recompute abaixo lê valores antigos
+        repo.recompute_protection_sync_pending(session, state)
+
     def _reconcile_positions_step(self, session, state, op_session) -> bool | None:
         """Returns True (clean), False (diverged), or None (couldn't even
         reach the exchange to compare)."""
         local_positions = [
-            {"symbol": p.symbol, "side": p.side, "qty": p.qty, "avg_entry_price": p.avg_entry_price}
+            {
+                "symbol": p.symbol, "side": p.side, "qty": p.qty, "avg_entry_price": p.avg_entry_price,
+                # Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2:
+                # comparado contra a proteção remota real quando disponível
+                # (BYBIT_DEMO) -- ver reconcile_positions().
+                "stop_loss": p.stop_loss, "take_profit": p.take_profit,
+            }
             for p in repo.open_positions(session)
         ]
         symbols = {p["symbol"] for p in local_positions}
@@ -792,6 +830,7 @@ class Orchestrator:
                 fill_service.apply_order_snapshot(
                     session, state, op_session, order, snapshot,
                     is_close=order.is_close, max_api_failures=self.settings.risk_max_api_failures,
+                    execution_engine=self.execution_engine,
                 )
 
             remote_open_orders: list[dict] = []

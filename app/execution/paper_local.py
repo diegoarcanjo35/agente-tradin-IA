@@ -140,3 +140,12 @@ class PaperLocalExecutionEngine:
 
     def get_position(self, symbol: str) -> dict | None:
         return self._positions.get(symbol)
+
+    def sync_position_protection(
+        self, symbol: str, side: str, stop_loss: float | None, take_profit: float | None
+    ) -> bool:
+        """Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2: PAPER_LOCAL
+        e PAPER_LIVE (que também usa este engine) nunca têm proteção remota
+        alguma a sincronizar -- nunca chamam nenhum endpoint, sempre
+        retornam True (nada pendente)."""
+        return True

@@ -196,6 +196,13 @@ class Position(Base):
     fees_paid: Mapped[float] = mapped_column(Float, default=0.0)
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2: "SYNCED" (padrão
+    # -- inclui PAPER_LOCAL/PAPER_LIVE, que nunca têm proteção remota a
+    # sincronizar) | "PENDING" (BYBIT_DEMO: sync remoto falhou, retry
+    # pendente) | "UNKNOWN" (BYBIT_DEMO: não foi possível nem confirmar o
+    # resultado da tentativa). Nunca vive só em memória -- ver
+    # app/persistence/repo.py::recompute_protection_sync_pending.
+    remote_protection_status: Mapped[str] = mapped_column(String(16), default="SYNCED")
 
 
 class AccountSnapshot(Base):
@@ -338,6 +345,13 @@ class SystemState(Base):
     reconciliation_stale: Mapped[bool] = mapped_column(Boolean, default=False)
     order_state_unknown: Mapped[bool] = mapped_column(Boolean, default=False)
     initialization_not_reconciled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2: entry-only
+    # (RiskContext.protection_sync_pending, checado só em evaluate() --
+    # nunca bloqueia fechamento/redução), true enquanto QUALQUER posição
+    # aberta tem remote_protection_status="PENDING"/"UNKNOWN". Sempre
+    # recomputado a partir do banco (nunca assumido) -- ver
+    # app/persistence/repo.py::recompute_protection_sync_pending.
+    protection_sync_pending: Mapped[bool] = mapped_column(Boolean, default=False)
     last_reconciliation_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Fase 2, item 7.8: process-is-running vs strategy-authorized-to-enter.
     # INICIALIZANDO -> OBSERVANDO -> ATIVO (operator action) -> PAUSADO

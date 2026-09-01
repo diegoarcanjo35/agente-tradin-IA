@@ -54,6 +54,22 @@ def reconcile_positions(local_positions: list[dict], remote_positions_by_symbol:
                     f"(diferença relativa {relative_diff:.4%} > tolerância {PRICE_RELATIVE_TOLERANCE:.2%})."
                 )
 
+        # Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2: proteção
+        # (stop/alvo) remota divergente da local -- só comparado quando o
+        # lado remoto efetivamente reporta o campo (PAPER engines nunca
+        # preenchem isso, então "ausente" nunca é tratado como mismatch).
+        for level_key, label in (("stop_loss", "stop-loss"), ("take_profit", "take-profit")):
+            local_level = local.get(level_key)
+            remote_level = remote.get(level_key)
+            if local_level is not None and remote_level is not None and local_level != 0:
+                level_diff = abs(remote_level - local_level) / abs(local_level)
+                if level_diff > PRICE_RELATIVE_TOLERANCE:
+                    mismatches.append(
+                        f"{symbol}: divergência de proteção remota ({label} mismatch) "
+                        f"local={local_level} corretora={remote_level} "
+                        f"(diferença relativa {level_diff:.4%} > tolerância {PRICE_RELATIVE_TOLERANCE:.2%})."
+                    )
+
     for symbol, remote in remote_positions_by_symbol.items():
         if remote is not None and symbol not in local_by_symbol:
             mismatches.append(

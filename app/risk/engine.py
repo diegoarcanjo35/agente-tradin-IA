@@ -86,6 +86,12 @@ class RiskContext:
     # block reducing/closing exposure). Defaults to False so every
     # pre-existing RiskContext construction is unaffected.
     engine_degraded: bool = False
+    # Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2: entry-only gate
+    # (never applied to evaluate_close -- a pending/unknown remote
+    # protection sync must never block reducing/closing exposure, only
+    # opening MORE of it). Defaults to False so every pre-existing
+    # RiskContext construction is unaffected.
+    protection_sync_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -182,6 +188,18 @@ class RiskEngine:
                 "engine_not_degraded",
                 "Motor de mercado degradado ou com heartbeat vencido; novas aberturas de "
                 "posição estão bloqueadas até o motor voltar a ficar saudável.",
+            )
+
+        # Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2: entry-only
+        # -- evaluate_close() nunca checa isso, então uma proteção remota
+        # pendente/desconhecida nunca bloqueia fechar/reduzir exposição.
+        checks["protection_not_pending"] = not context.protection_sync_pending
+        if context.protection_sync_pending:
+            return reject(
+                "protection_not_pending",
+                "Sincronização da proteção remota (stop/alvo) pendente ou desconhecida em alguma "
+                "posição aberta; novas aberturas de posição estão bloqueadas até a proteção ser "
+                "confirmada.",
             )
 
         checks["cooldown_expired"] = (

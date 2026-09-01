@@ -275,4 +275,53 @@ class BybitDemoExecutionEngine:
             "side": row.get("side"),
             "qty": float(row.get("size", 0)),
             "avg_entry_price": float(row.get("avgPrice", 0)),
+            # Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2: usado
+            # pela reconciliação para detectar proteção remota divergente
+            # da local -- Bybit devolve "" ou "0" quando não há stop/alvo
+            # configurado, nunca omite o campo.
+            "stop_loss": _parse_optional_protection_level(row.get("stopLoss")),
+            "take_profit": _parse_optional_protection_level(row.get("takeProfit")),
         }
+
+    def sync_position_protection(
+        self, symbol: str, side: str, stop_loss: float | None, take_profit: float | None
+    ) -> bool:
+        """Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2: `POST
+        /v5/position/trading-stop`, `tpslMode=Full` (protege a posição
+        inteira, ajustando a quantidade conforme o tamanho aberto --
+        documentação oficial Bybit), `positionIdx=0` (compatível com o modo
+        one-way já usado por este engine em `submit()`), ordens de proteção
+        Market. Nunca levanta para uma falha de transporte esperada --
+        retorna False, o chamador (`fill_service._sync_remote_protection`)
+        decide a política de bloqueio/retry."""
+        try:
+            resp = self._http_post(
+                f"{self.base_url}/v5/position/trading-stop",
+                {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "positionIdx": 0,
+                    "tpslMode": "Full",
+                    "stopLoss": f"{stop_loss:.2f}" if stop_loss is not None else "",
+                    "takeProfit": f"{take_profit:.2f}" if take_profit is not None else "",
+                    "slOrderType": "Market",
+                    "tpOrderType": "Market",
+                },
+            )
+        except (ExchangeTimeoutError, RateLimitError) as exc:
+            log_event(logger, 40, "position_protection_sync_failed", error=str(exc))
+            return False
+        # Bybit V5: retCode 0 é sucesso; retCode 34040 ("not modified" -- os
+        # níveis pedidos já são os vigentes) também conta como sincronizado.
+        ret_code = resp.get("retCode")
+        return ret_code in (0, 34040)
+
+
+def _parse_optional_protection_level(raw) -> float | None:
+    if raw in (None, "", "0"):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value != 0 else None

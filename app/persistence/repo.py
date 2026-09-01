@@ -94,6 +94,22 @@ def recompute_trading_blocked(state: SystemState, max_api_failures: int) -> None
             state.operational_state = "OBSERVANDO"
 
 
+def recompute_protection_sync_pending(session: Session, state: SystemState) -> None:
+    """Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2: sempre
+    recomputado a partir do banco (nunca assumido/carregado de memória) --
+    true enquanto QUALQUER posição aberta tem `remote_protection_status`
+    diferente de 'SYNCED'. Chamado tanto logo após uma tentativa de
+    sincronização (fill_service) quanto no boot/reconciliação periódica
+    (Orchestrator.reconcile()), para que o estado de bloqueio sempre
+    reflita o banco, sobrevivendo a um reinício do processo."""
+    pending_exists = session.execute(
+        select(Position.id).where(
+            Position.status == "OPEN", Position.remote_protection_status != "SYNCED",
+        ).limit(1)
+    ).scalar_one_or_none() is not None
+    state.protection_sync_pending = pending_exists
+
+
 def record_security_event(session: Session, event_type: str, detail: str) -> SecurityEvent:
     ev = SecurityEvent(event_type=event_type, detail=detail)
     session.add(ev)

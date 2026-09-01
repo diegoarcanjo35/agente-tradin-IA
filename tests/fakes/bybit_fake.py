@@ -39,6 +39,10 @@ class FakeBybitTransport:
         self.funding_pages: list | None = None  # global FIFO page queue (correção v1.2 #3)
         self.post_calls: list[tuple[str, dict]] = []
         self.get_calls: list[tuple[str, dict]] = []
+        # Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2:
+        self.positions: dict[str, dict] = {}  # symbol -> row for /v5/position/list
+        self.trading_stop_calls: list[dict] = []  # every payload sent to trading-stop
+        self.trading_stop_ret_code = 0  # override to simulate a non-zero retCode without raising
 
     def http_post(self, url: str, payload: dict) -> dict:
         self.post_calls.append((url, payload))
@@ -51,6 +55,14 @@ class FakeBybitTransport:
 
         if url.endswith("/v5/order/cancel"):
             return {"retCode": 0, "result": {"orderId": payload.get("orderId")}}
+
+        if url.endswith("/v5/position/trading-stop"):
+            self.trading_stop_calls.append(payload)
+            symbol = payload.get("symbol")
+            if symbol in self.positions:
+                self.positions[symbol]["stopLoss"] = payload.get("stopLoss", "")
+                self.positions[symbol]["takeProfit"] = payload.get("takeProfit", "")
+            return {"retCode": self.trading_stop_ret_code, "result": {}, "retMsg": "OK"}
 
         order_link_id = payload["orderLinkId"]
         order_id = f"EX-{order_link_id[:12]}"
@@ -82,6 +94,10 @@ class FakeBybitTransport:
             if self.funding_pages is not None:
                 return self._pop_page_from_list(self.funding_pages)
             return {"retCode": 0, "result": {"list": self.funding_events}}
+        if url.endswith("/v5/position/list"):
+            symbol = params.get("symbol")
+            row = self.positions.get(symbol)
+            return {"retCode": 0, "result": {"list": [row] if row else []}}
         return {"retCode": 0, "result": {"list": []}}
 
     @staticmethod
@@ -149,3 +165,19 @@ class FakeBybitTransport:
         since a single BybitFundingProvider only ever queries one symbol
         per test."""
         self.funding_pages = list(pages)
+
+    def set_position(
+        self, symbol: str, side: str, qty: float, avg_price: float,
+        stop_loss: float | None = None, take_profit: float | None = None,
+    ) -> None:
+        """Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2: mesmo
+        formato de linha de `/v5/position/list` real -- `stopLoss`/
+        `takeProfit` como string, "" quando ausente (nunca omitidos)."""
+        self.positions[symbol] = {
+            "symbol": symbol, "side": side, "size": str(qty), "avgPrice": str(avg_price),
+            "stopLoss": f"{stop_loss:.2f}" if stop_loss is not None else "",
+            "takeProfit": f"{take_profit:.2f}" if take_profit is not None else "",
+        }
+
+    def clear_position(self, symbol: str) -> None:
+        self.positions.pop(symbol, None)

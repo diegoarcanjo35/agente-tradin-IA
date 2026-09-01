@@ -131,4 +131,10 @@ class PybitTransport:
         if url.endswith("/v5/order/cancel"):
             clean_payload = {k: v for k, v in payload.items() if v is not None}
             return self._call(self._client.cancel_order, **clean_payload)
+        if url.endswith("/v5/position/trading-stop"):
+            # Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2:
+            # sincroniza a proteção (stop/alvo) da posição já aberta --
+            # nunca cria/envia uma nova ordem.
+            clean_payload = {k: v for k, v in payload.items() if v is not None}
+            return self._call(self._client.set_trading_stop, **clean_payload)
         raise NotImplementedError(f"No pybit POST mapping for {url}")

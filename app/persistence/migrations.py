@@ -73,7 +73,7 @@ from sqlalchemy.engine import Connection, Engine
 
 from app.persistence.models import Base
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 
 class MigrationError(Exception):
@@ -392,6 +392,26 @@ def _migrate_to_v6(conn: Connection) -> None:
         ))
 
 
+def _migrate_to_v7(conn: Connection) -> None:
+    """Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2: a proteção
+    remota (stop/alvo na corretora, BYBIT_DEMO) precisa ser sincronizada
+    com os níveis locais recalculados a cada fill -- e essa sincronização
+    pode falhar (timeout, rate limit). Esse estado precisa sobreviver a um
+    reinício do processo, nunca viver só em memória. `remote_protection_
+    status` é adicionado com DEFAULT 'SYNCED' -- toda posição pré-existente
+    (aberta sob a regra antiga, sem sincronização remota nunca tentada)
+    permanece corretamente marcada como sem pendência alguma; nada tenta
+    sincronizar retroativamente."""
+    if not _column_exists(conn, "positions", "remote_protection_status"):
+        conn.execute(text(
+            "ALTER TABLE positions ADD COLUMN remote_protection_status VARCHAR(16) NOT NULL DEFAULT 'SYNCED'"
+        ))
+    if not _column_exists(conn, "system_state", "protection_sync_pending"):
+        conn.execute(text(
+            "ALTER TABLE system_state ADD COLUMN protection_sync_pending BOOLEAN NOT NULL DEFAULT 0"
+        ))
+
+
 # Order matters: applied strictly in ascending version order.
 MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
     (1, "Adiciona system_state.state_ambiguous, orders.is_close; relaxa orders.stop_loss para opcional.", _migrate_to_v1),
@@ -412,6 +432,10 @@ MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
         "checkpoint explícito de cobertura de coleta de funding, nunca derivado do maior occurred_at já "
         "persistido em funding_events.",
      _migrate_to_v6),
+    (7, "Adiciona positions.remote_protection_status e system_state.protection_sync_pending -- estado "
+        "persistido (nunca só em memória) de sincronização da proteção remota (stop/alvo) na corretora "
+        "BYBIT_DEMO após recálculo pós-preenchimento.",
+     _migrate_to_v7),
 ]
 
 
@@ -495,6 +519,19 @@ def _v6_invariants_satisfied(conn: Connection) -> bool:
     )
 
 
+def _v7_invariants_satisfied(conn: Connection) -> bool:
+    """ALL structural invariants of v7 -- both columns exist and genuinely
+    reject NULL (their NOT NULL DEFAULT is what guarantees every
+    pre-existing row got a safe default -- 'SYNCED'/0 -- rather than
+    silently ending up NULL)."""
+    return (
+        _column_exists(conn, "positions", "remote_protection_status")
+        and not _column_is_nullable(conn, "positions", "remote_protection_status")
+        and _column_exists(conn, "system_state", "protection_sync_pending")
+        and not _column_is_nullable(conn, "system_state", "protection_sync_pending")
+    )
+
+
 _VERSION_INVARIANTS: dict[int, Callable[[Connection], bool]] = {
     1: _v1_invariants_satisfied,
     2: _v2_invariants_satisfied,
@@ -502,6 +539,7 @@ _VERSION_INVARIANTS: dict[int, Callable[[Connection], bool]] = {
     4: _v4_invariants_satisfied,
     5: _v5_invariants_satisfied,
     6: _v6_invariants_satisfied,
+    7: _v7_invariants_satisfied,
 }
 
 

@@ -118,6 +118,7 @@ def engage_kill_switch(request: Request):
             result = fill_service.apply_order_snapshot(
                 session, state, op_session, order, snapshot,
                 is_close=order.is_close, max_api_failures=orch.settings.risk_max_api_failures,
+                execution_engine=orch.execution_engine,
             )
             if result.status == OrderStatus.CANCELLED:
                 cancelled_order_ids.append(order.id)
