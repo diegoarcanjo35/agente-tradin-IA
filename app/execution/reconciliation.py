@@ -54,14 +54,42 @@ def reconcile_positions(local_positions: list[dict], remote_positions_by_symbol:
                     f"(diferença relativa {relative_diff:.4%} > tolerância {PRICE_RELATIVE_TOLERANCE:.2%})."
                 )
 
-        # Correção Stop/Take Pós-Preenchimento v1.1, Bloqueio 2: proteção
-        # (stop/alvo) remota divergente da local -- só comparado quando o
-        # lado remoto efetivamente reporta o campo (PAPER engines nunca
-        # preenchem isso, então "ausente" nunca é tratado como mismatch).
+        # Correção Stop/Take v1.2: a CHAVE (não o valor) é o que diz se o
+        # engine suporta proteção remota. PAPER nunca inclui a chave --
+        # ausência estrutural continua "não suportado, não comparar". Já o
+        # BYBIT_DEMO SEMPRE inclui a chave; um valor None/zero ali é a
+        # corretora dizendo explicitamente "sem proteção configurada", o
+        # que É uma divergência real se o lado local tem um nível. O
+        # `local.get(...)`/`remote.get(...)` antigo tratava as duas coisas
+        # (chave ausente vs. valor ausente) como idênticas, escondendo
+        # exatamente essa divergência -- ver reprodução em
+        # tests/test_reconciliation_protection_absence.py.
         for level_key, label in (("stop_loss", "stop-loss"), ("take_profit", "take-profit")):
+            if level_key not in remote:
+                continue  # engine não suporta este campo -- nunca comparar (regra 1)
             local_level = local.get(level_key)
             remote_level = remote.get(level_key)
-            if local_level is not None and remote_level is not None and local_level != 0:
+            if remote_level == 0:
+                remote_level = None  # a corretora usa 0/"" para "sem proteção"
+
+            if local_level is None and remote_level is None:
+                continue  # regra 5: ambos ausentes -- sem divergência
+
+            if local_level is not None and remote_level is None:
+                mismatches.append(
+                    f"{symbol}: proteção remota ausente ({label} mismatch) local={local_level} "
+                    f"corretora=None -- a corretora não reporta nenhuma proteção neste nível."
+                )
+                continue
+
+            if local_level is None and remote_level is not None:
+                mismatches.append(
+                    f"{symbol}: proteção remota desconhecida localmente ({label} mismatch) local=None "
+                    f"corretora={remote_level} -- a corretora possui um nível que o estado local ignora."
+                )
+                continue
+
+            if local_level != 0:
                 level_diff = abs(remote_level - local_level) / abs(local_level)
                 if level_diff > PRICE_RELATIVE_TOLERANCE:
                     mismatches.append(
